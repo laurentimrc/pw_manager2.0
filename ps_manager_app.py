@@ -1,19 +1,22 @@
 import streamlit as st
 import json
-from cryptography.fernet import Fernet  # Per la crittografia
-import base64  # Per la gestione della chiave
-import random  # Per il generatore di password
-import string  # Per il generatore di password
+from cryptography.fernet import Fernet
+import base64
+import random
+import string
 import bcrypt  # Per l'hashing della master password
-import os  # Per controllare l'esistenza del file hash
+import os
+import hashlib  # Per PBKDF2HMAC (KDF)
 
 # PRIMO COMANDO STREAMLIT DEVE ESSERE QUESTO:
-st.set_page_config(page_title="Password Manager Sicuro", layout="centered")  # Titolo leggermente cambiato
+st.set_page_config(page_title="Password Manager KDF", layout="centered")
 
 # --- Costanti ---
-KEY_FILE = "secret.key"  # Ancora usato per la crittografia dei dati, vedi nota sulla KDF per miglioramenti futuri
+# KEY_FILE = "secret.key" # RIMOSSO - Non più necessario
 PASSWORDS_FILE = "passwords.json"
-MASTER_HASH_FILE = "master_pwd.hash"  # File per memorizzare l'hash della master password
+MASTER_HASH_FILE = "master_pwd.hash"
+KDF_SALT_FILE = "kdf.salt"  # Nuovo file per il salt della KDF
+PBKDF2_ITERATIONS = 250000  # Numero di iterazioni per PBKDF2 (più alto è, più sicuro ma più lento)
 
 
 # --- Funzione Generatore Password ---
@@ -43,15 +46,12 @@ def genera_password_casuale(length, use_uppercase, use_lowercase, use_digits, us
 
 # --- Gestione Master Password Hashing (bcrypt) ---
 def set_master_password_hash(plain_password):
-    """Genera l'hash di una password e lo salva."""
     salt = bcrypt.gensalt()
     hashed_password = bcrypt.hashpw(plain_password.encode('utf-8'), salt)
-    with open(MASTER_HASH_FILE, "wb") as f:
-        f.write(hashed_password)
+    with open(MASTER_HASH_FILE, "wb") as f: f.write(hashed_password)
 
 
 def load_master_password_hash():
-    """Carica l'hash della master password dal file."""
     try:
         with open(MASTER_HASH_FILE, "rb") as f:
             return f.read()
@@ -60,43 +60,63 @@ def load_master_password_hash():
 
 
 def verifica_master_password_con_hash(plain_password, stored_hash_bytes):
-    """Verifica una password in chiaro contro un hash memorizzato."""
-    if not plain_password or not stored_hash_bytes:
-        return False
-    return bcrypt.checkpw(plain_password.encode('utf-8'), stored_hash_bytes)
-
-
-# --- Gestione della Chiave di Crittografia (Ancora separata per ora) ---
-def genera_chiave():
-    key = Fernet.generate_key()
-    with open(KEY_FILE, "wb") as key_file: key_file.write(key)
-    return key
-
-
-def carica_chiave():
+    if not plain_password or not stored_hash_bytes: return False
     try:
-        with open(KEY_FILE, "rb") as key_file:
-            return key_file.read()
+        return bcrypt.checkpw(plain_password.encode('utf-8'), stored_hash_bytes)
+    except ValueError:  # Può accadere se stored_hash_bytes non è un hash bcrypt valido
+        return False
+
+
+# --- Gestione KDF e Chiave di Crittografia Dati ---
+def generate_and_save_kdf_salt():
+    """Genera un nuovo salt per KDF e lo salva."""
+    salt = os.urandom(16)  # 16 bytes di salt casuale
+    with open(KDF_SALT_FILE, "wb") as f:
+        f.write(salt)
+    return salt
+
+
+def load_kdf_salt():
+    """Carica il salt KDF dal file."""
+    try:
+        with open(KDF_SALT_FILE, "rb") as f:
+            return f.read()
     except FileNotFoundError:
-        st.warning(
-            f"File chiave '{KEY_FILE}' non trovato. Ne verrà generato uno nuovo la prima volta che si salva una password.")
-        # La chiave verrà effettivamente generata e salvata solo quando serve la prima volta
-        return None  # Non generare subito, ma al primo salvataggio se non esiste
+        return None
 
 
-key_bytes = carica_chiave()  # Può essere None inizialmente
-cipher_suite = Fernet(key_bytes) if key_bytes else None
+def derive_encryption_key(master_password_str, salt_bytes):
+    """Deriva una chiave di crittografia usando PBKDF2HMAC dalla master password e dal salt."""
+    if not master_password_str or not salt_bytes:
+        raise ValueError("Master password e salt non possono essere vuoti per la derivazione della chiave.")
+
+    # PBKDF2HMAC necessita di password e salt come bytes
+    password_bytes = master_password_str.encode('utf-8')
+
+    # Deriva la chiave grezza
+    # Fernet richiede una chiave di 32 byte
+    derived_key_raw = hashlib.pbkdf2_hmac(
+        'sha256',  # Algoritmo di hash
+        password_bytes,
+        salt_bytes,
+        PBKDF2_ITERATIONS,
+        dklen=32  # Lunghezza della chiave desiderata in byte per Fernet
+    )
+    # Fernet richiede una chiave codificata in base64 URL-safe
+    fernet_key = base64.urlsafe_b64encode(derived_key_raw)
+    return fernet_key
 
 
-def get_cipher_suite():
-    """Ottiene o crea la cipher suite. Crea la chiave se non esiste."""
-    global key_bytes, cipher_suite
-    if not key_bytes:
-        st.info(f"Creazione di una nuova chiave di crittografia ({KEY_FILE})...")
-        key_bytes = genera_chiave()
-        cipher_suite = Fernet(key_bytes)
-        st.success(f"Nuova chiave di crittografia '{KEY_FILE}' generata. Conservala con cura!")
-    return cipher_suite
+def get_cipher_suite_kdf():
+    """Ottiene la cipher suite usando la chiave Fernet derivata memorizzata in session_state."""
+    if "derived_fernet_key" not in st.session_state or not st.session_state.derived_fernet_key:
+        st.error("Chiave di crittografia non disponibile in sessione. Eseguire il login.")
+        return None
+    try:
+        return Fernet(st.session_state.derived_fernet_key)
+    except Exception as e:
+        st.error(f"Errore nell'inizializzare la cipher suite con la chiave derivata: {e}")
+        return None
 
 
 # --- Gestione delle Password (JSON) ---
@@ -113,36 +133,38 @@ def salva_passwords_criptate(passwords_criptate):
 
 
 def cripta_messaggio(messaggio_bytes):
-    cs = get_cipher_suite()
+    cs = get_cipher_suite_kdf()
+    if not cs: return None  # Errore già gestito da get_cipher_suite_kdf
     return cs.encrypt(messaggio_bytes)
 
 
 def decripta_messaggio(messaggio_criptato_bytes):
-    cs = get_cipher_suite()
-    if not cs:  # Se la chiave non è ancora stata caricata/generata
-        st.error("Chiave di crittografia non disponibile. Impossibile decriptare.")
-        return None
+    cs = get_cipher_suite_kdf()
+    if not cs: return None  # Errore già gestito da get_cipher_suite_kdf
     try:
         return cs.decrypt(messaggio_criptato_bytes)
-    except Exception as e:
-        st.error(f"Errore durante la decriptazione: {e}. La chiave potrebbe essere errata/cambiata o i dati corrotti.")
+    except Exception as e:  # cryptography.fernet.InvalidToken o altri
+        st.error(
+            f"Errore durante la decriptazione: {e}. La master password potrebbe essere errata (se la chiave è stata derivata male) o i dati corrotti.")
         return None
 
 
 # --- Interfaccia Streamlit ---
-st.title("🔑 Password Manager Sicuro")
+st.title("🔑 Password Manager KDF")
 st.caption("⚠️ Attenzione: Questo è un esempio didattico. Per uso produttivo, considera soluzioni auditate.")
 
 # --- Logica di Autenticazione e Setup ---
 stored_master_hash = load_master_password_hash()
+kdf_salt = load_kdf_salt()  # Carica il salt KDF all'avvio
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+if "derived_fernet_key" not in st.session_state:  # Assicura che esista la chiave in session_state
+    st.session_state.derived_fernet_key = None
 
 if not stored_master_hash:  # --- MODALITÀ SETUP MASTER PASSWORD ---
     st.subheader("🔑 Imposta la tua Master Password")
-    st.info(
-        "Benvenuto! Sembra essere il primo avvio o la master password non è stata ancora impostata. Scegli una password robusta e unica. Questa password sarà usata per proteggere l'accesso al tuo gestore di password.")
+    st.info("Benvenuto! Configura la tua master password. Questa password cripterà i tuoi dati.")
 
     with st.form("setup_master_form"):
         new_master_pwd = st.text_input("Nuova Master Password:", type="password", key="new_master_setup")
@@ -152,38 +174,56 @@ if not stored_master_hash:  # --- MODALITÀ SETUP MASTER PASSWORD ---
         if submitted_setup:
             if not new_master_pwd or not confirm_master_pwd:
                 st.error("Entrambi i campi sono obbligatori.")
-            elif len(new_master_pwd) < 10:  # Aumentato il requisito minimo
-                st.error("La master password deve essere di almeno 10 caratteri per una maggiore sicurezza.")
+            elif len(new_master_pwd) < 10:
+                st.error("La master password deve essere di almeno 10 caratteri.")
             elif new_master_pwd != confirm_master_pwd:
                 st.error("Le password non coincidono.")
             else:
                 try:
-                    set_master_password_hash(new_master_pwd)
+                    set_master_password_hash(new_master_pwd)  # Salva l'hash della master password
+                    current_kdf_salt = generate_and_save_kdf_salt()  # Genera e salva il salt KDF
+
+                    # Deriva e memorizza la chiave Fernet per la sessione corrente
+                    fernet_key_for_session = derive_encryption_key(new_master_pwd, current_kdf_salt)
+                    st.session_state.derived_fernet_key = fernet_key_for_session
+
                     st.session_state.authenticated = True
-                    # Assicura che la chiave di crittografia sia pronta
-                    get_cipher_suite()
-                    st.success("Master password impostata con successo! Accesso effettuato.")
+                    st.success(
+                        "Master password impostata e chiave di crittografia derivata con successo! Accesso effettuato.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Errore durante l'impostazione della master password: {e}")
-    st.stop()  # Ferma l'esecuzione dello script qui se siamo in setup
+                    st.error(f"Errore durante l'impostazione della master password o derivazione chiave: {e}")
+    st.stop()
 
 elif not st.session_state.authenticated:  # --- MODALITÀ LOGIN ---
     st.subheader("Login")
     master_password_input = st.text_input("Inserisci la Master Password:", type="password", key="master_pwd_login")
     if st.button("Sblocca", key="unlock_btn"):
-        if verifica_master_password_con_hash(master_password_input, stored_master_hash):
-            st.session_state.authenticated = True
-            st.success("Accesso effettuato!")
-            st.rerun()
+        if not kdf_salt:  # Controllo di coerenza: il salt dovrebbe esistere se l'hash esiste
+            st.error(
+                "Errore critico: File KDF salt mancante. Impossibile procedere. Potrebbe essere necessario resettare l'applicazione.")
+        elif verifica_master_password_con_hash(master_password_input, stored_master_hash):
+            try:
+                # Deriva e memorizza la chiave Fernet per la sessione corrente
+                fernet_key_for_session = derive_encryption_key(master_password_input, kdf_salt)
+                st.session_state.derived_fernet_key = fernet_key_for_session
+
+                st.session_state.authenticated = True
+                st.success("Accesso effettuato!")
+                st.rerun()
+            except ValueError as ve:  # Errore da derive_encryption_key
+                st.error(f"Errore durante la derivazione della chiave: {ve}")
+            except Exception as e:
+                st.error(f"Errore imprevisto durante il login o la derivazione chiave: {e}")
         else:
             st.error("Master Password errata.")
-    st.stop()  # Ferma l'esecuzione se non autenticato
+    st.stop()
 
-# --- SEZIONE AUTENTICATA DELL'APP ---
+# --- SEZIONE AUTENTICATA DELL'APP (il resto del codice rimane per lo più invariato) ---
 st.sidebar.success("Accesso effettuato!")
 if st.sidebar.button("Blocca App", key="lock_app_btn"):
     st.session_state.authenticated = False
+    st.session_state.derived_fernet_key = None  # Pulisce la chiave derivata dalla sessione
     if 'master_pwd_login' in st.session_state: del st.session_state['master_pwd_login']
     st.rerun()
 
@@ -191,6 +231,10 @@ st.header("Gestione Password")
 menu = ["➕ Aggiungi Nuova Password", "👀 Visualizza Password", "🗑️ Elimina Password"]
 scelta = st.sidebar.selectbox("Menu", menu)
 passwords_criptate_db = carica_passwords_criptate()
+
+# ... (Le sezioni "Aggiungi", "Visualizza", "Elimina" rimangono sostanzialmente le stesse,
+#      poiché ora usano cripta_messaggio e decripta_messaggio che a loro volta
+#      usano get_cipher_suite_kdf() con la chiave derivata.)
 
 if scelta == "➕ Aggiungi Nuova Password":
     st.subheader("Aggiungi Nuova Credenziale")
@@ -229,16 +273,18 @@ if scelta == "➕ Aggiungi Nuova Password":
 
         if submitted:
             if servizio and username and nuova_password:
-                pass_criptata = cripta_messaggio(nuova_password.encode()).decode()
-                passwords_criptate_db[servizio] = {"username": username, "password_criptata": pass_criptata}
-                salva_passwords_criptate(passwords_criptate_db)
-                st.success(f"Credenziale per '{servizio}' aggiunta/aggiornata!")
-                st.session_state.generated_password_value_display = ""
+                encrypted_pass_bytes = cripta_messaggio(nuova_password.encode())
+                if encrypted_pass_bytes:  # Verifica che la crittografia sia andata a buon fine
+                    passwords_criptate_db[servizio] = {"username": username,
+                                                       "password_criptata": encrypted_pass_bytes.decode()}
+                    salva_passwords_criptate(passwords_criptate_db)
+                    st.success(f"Credenziale per '{servizio}' aggiunta/aggiornata!")
+                    st.session_state.generated_password_value_display = ""
+                # else: l'errore è già mostrato da cripta_messaggio
             else:
                 st.error("Per favore, compila tutti i campi.")
 
 elif scelta == "👀 Visualizza Password":
-    # ... (codice per visualizzare le password, invariato rispetto all'ultima versione, assicurati che usi decripta_messaggio()) ...
     st.subheader("Le Tue Credenziali Salvate")
     if not passwords_criptate_db:
         st.info("Nessuna password salvata al momento.")
@@ -257,14 +303,12 @@ elif scelta == "👀 Visualizza Password":
                     if password_decriptata_bytes:
                         st.text_input("Password:", value=password_decriptata_bytes.decode(), type="default",
                                       disabled=True, key=f"pwd_text_{servizio_idx}_visible")
-                    else:
-                        st.error("Impossibile decriptare la password.")  # Errore già mostrato da decripta_messaggio
+                    # else: l'errore è già mostrato da decripta_messaggio
                 else:
                     st.text_input("Password:", value="∗∗∗∗∗∗∗∗∗∗", type="default", disabled=True,
                                   key=f"pwd_text_{servizio_idx}_hidden")
 
 elif scelta == "🗑️ Elimina Password":
-    # ... (codice per eliminare le password, invariato rispetto all'ultima versione) ...
     st.subheader("Elimina Credenziale")
     if not passwords_criptate_db:
         st.info("Nessuna password da eliminare.")
@@ -284,5 +328,5 @@ elif scelta == "🗑️ Elimina Password":
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Hash Master Pwd:** `{MASTER_HASH_FILE}`")
-st.sidebar.markdown(f"**Chiave Crittografia Dati:** `{KEY_FILE}`")
+st.sidebar.markdown(f"**Salt KDF:** `{KDF_SALT_FILE}`")  # Mostra il file del salt
 st.sidebar.markdown(f"**Database Password:** `{PASSWORDS_FILE}`")
