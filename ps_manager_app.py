@@ -285,6 +285,11 @@ def main():
                     "Nessuna credenziale trovata." if not search_term else f"Nessuna credenziale trovata per '{search_term}'.")
 
             for service, data in filtered_creds.items():
+                # Definisco una chiave unica per lo stato di visibilità della password di questo servizio
+                show_password_key = f"show_pwd_{service}"
+                if show_password_key not in st.session_state:
+                    st.session_state[show_password_key] = False
+
                 if st.session_state.editing_service == service:
                     with st.expander(f"📝 Modifica: **{service}**", expanded=True):
                         with st.form(key=f"edit_{service}"):
@@ -306,14 +311,29 @@ def main():
                     with st.expander(f"🔑 {service}"):
                         st.text_input("Username/Email", value=data['username'], disabled=True,
                                       key=f"disp_user_{service}")
-                        st.text_input("Password", value="∗∗∗∗∗∗∗∗∗", disabled=True, key=f"disp_pwd_{service}")
+
+                        # --- LOGICA MOSTRA/NASCONDI ---
+                        # 1. Determina il valore da mostrare nel campo password
+                        is_visible = st.session_state[show_password_key]
+                        password_to_display = data['password'] if is_visible else "∗∗∗∗∗∗∗∗∗"
+
+                        st.text_input("Password", value=password_to_display, disabled=True, key=f"disp_pwd_{service}")
 
                         c1, c2, c3 = st.columns(3)
-                        if c1.button("Mostra Password", key=f"show_{service}"):
-                            st.info(f"**Password per {service}:** `{data['password']}`")
+
+                        # 2. Crea il pulsante toggle
+                        button_label = "Nascondi Password" if is_visible else "Mostra Password"
+                        if c1.button(button_label, key=f"toggle_{service}"):
+                            st.session_state[show_password_key] = not st.session_state[show_password_key]
+                            st.rerun()
+                        # --- FINE LOGICA ---
+
                         if c2.button("Modifica", key=f"edit_{service}"):
+                            # Quando si entra in modifica, nascondi di nuovo la password per sicurezza
+                            st.session_state[show_password_key] = False
                             st.session_state.editing_service = service
                             st.rerun()
+
                         if c3.button("🗑️ Elimina", key=f"del_{service}", type="primary"):
                             manager.delete_credential(service)
                             st.success(f"Credenziale per '{service}' eliminata.")
