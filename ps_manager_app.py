@@ -1,558 +1,400 @@
 import streamlit as st
 import json
-from cryptography.fernet import Fernet
+import os
+import bcrypt
 import base64
+import hashlib
 import random
 import string
-import bcrypt  # Per l'hashing della master password
-import os
-import hashlib  # Per PBKDF2HMAC (KDF)
-from zxcvbn import zxcvbn  # Per la robustezza della password
+from cryptography.fernet import Fernet
+from zxcvbn import zxcvbn
+from typing import Dict, Any, Optional, Tuple
 
-# PRIMO COMANDO STREAMLIT DEVE ESSERE QUESTO:
-st.set_page_config(page_title="Password Manager Pro", layout="wide")
+# --- CONFIGURAZIONE INIZIALE STREAMLIT ---
+st.set_page_config(page_title="Password Manager Pro", layout="wide", initial_sidebar_state="expanded")
 
-# --- Costanti ---
+# --- COSTANTI DI CONFIGURAZIONE ---
 PASSWORDS_FILE = "passwords.json"
 MASTER_HASH_FILE = "master_pwd.hash"
 KDF_SALT_FILE = "kdf.salt"
-PBKDF2_ITERATIONS = 250000
+PBKDF2_ITERATIONS = 600000  # Aumentato per maggiore sicurezza (raccomandazione OWASP)
+SYMBOLS = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 AMBIGUOUS_CHARACTERS = "Il1O0|'`"
 
 
-# --- Funzione Indicatore Robustezza Password ---
-def get_password_strength_feedback(password):
-    if not password:
-        return "", "", 0, ""
+# --- CLASSE DI GESTIONE LOGICA ---
+class PasswordManager:
+    """
+    Incapsula tutta la logica di gestione delle password:
+    - Gestione file (hash, salt, database)
+    - Operazioni crittografiche (hashing, derivazione chiave, cifratura)
+    - Operazioni CRUD sulle credenziali.
+    """
 
+    def __init__(self, hash_file: str, salt_file: str, db_file: str):
+        self.hash_file = hash_file
+        self.salt_file = salt_file
+        self.db_file = db_file
+        self.cipher_suite: Optional[Fernet] = None
+
+    # --- Gestione Master Password & Salt ---
+    def master_hash_exists(self) -> bool:
+        return os.path.exists(self.hash_file)
+
+    def load_master_hash(self) -> Optional[bytes]:
+        if not self.master_hash_exists(): return None
+        with open(self.hash_file, "rb") as f:
+            return f.read()
+
+    def set_master_hash(self, password: str) -> None:
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt)
+        with open(self.hash_file, "wb") as f:
+            f.write(hashed_password)
+
+    def verify_master_password(self, password: str) -> bool:
+        stored_hash = self.load_master_hash()
+        if not password or not stored_hash: return False
+        try:
+            return bcrypt.checkpw(password.encode('utf-8'), stored_hash)
+        except ValueError:
+            return False
+
+    def load_kdf_salt(self) -> Optional[bytes]:
+        if not os.path.exists(self.salt_file): return None
+        with open(self.salt_file, "rb") as f:
+            return f.read()
+
+    def generate_and_save_kdf_salt(self) -> bytes:
+        salt = os.urandom(16)
+        with open(self.salt_file, "wb") as f:
+            f.write(salt)
+        return salt
+
+    # --- Gestione Chiave di Crittografia ---
+    def derive_and_set_cipher(self, master_password: str, salt: bytes) -> None:
+        key = hashlib.pbkdf2_hmac('sha256', master_password.encode('utf-8'), salt, PBKDF2_ITERATIONS, dklen=32)
+        fernet_key = base64.urlsafe_b64encode(key)
+        self.cipher_suite = Fernet(fernet_key)
+
+    # --- Gestione Database Password (Criptato) ---
+    def load_encrypted_db(self) -> Dict[str, Any]:
+        try:
+            with open(self.db_file, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def save_encrypted_db(self, data: Dict[str, Any]) -> None:
+        with open(self.db_file, "w") as f:
+            json.dump(data, f, indent=4)
+
+    def get_decrypted_passwords(self) -> Optional[Dict[str, Dict[str, str]]]:
+        if not self.cipher_suite: return None
+
+        encrypted_db = self.load_encrypted_db()
+        decrypted_data = {}
+        for service, credentials in encrypted_db.items():
+            try:
+                decrypted_password = self.cipher_suite.decrypt(credentials['password_criptata'].encode()).decode()
+                decrypted_data[service] = {
+                    "username": credentials['username'],
+                    "password": decrypted_password
+                }
+            except Exception:
+                decrypted_data[service] = {
+                    "username": credentials['username'],
+                    "password": "ERRORE DI DECRIPTAZIONE"
+                }
+        return decrypted_data
+
+    def add_credential(self, service: str, username: str, password: str) -> bool:
+        if not self.cipher_suite: return False
+
+        encrypted_password = self.cipher_suite.encrypt(password.encode()).decode()
+        db = self.load_encrypted_db()
+        db[service] = {"username": username, "password_criptata": encrypted_password}
+        self.save_encrypted_db(db)
+        return True
+
+    def update_credential(self, service: str, new_username: str, new_password: str) -> bool:
+        return self.add_credential(service, new_username, new_password)
+
+    def delete_credential(self, service: str) -> None:
+        db = self.load_encrypted_db()
+        if service in db:
+            del db[service]
+            self.save_encrypted_db(db)
+
+
+# --- FUNZIONI HELPER UI ---
+def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:
+    if not password: return "", "", 0, "grey"
     results = zxcvbn(password)
     score = results['score']
     feedback_text = results.get('feedback', {}).get('warning', '')
     suggestions = " ".join(results.get('feedback', {}).get('suggestions', []))
-
-    full_feedback = feedback_text
-    if suggestions:
-        full_feedback += " " + suggestions if full_feedback else suggestions
+    full_feedback = f"{feedback_text} {suggestions}".strip()
 
     strength_map = {
         0: ("Pessima 😱", "red"), 1: ("Debole 😟", "orange"), 2: ("Discreta 🤔", "yellow"),
-        3: ("Buona 😊", "lightgreen"), 4: ("Ottima! 💪", "green")
+        3: ("Buona 😊", "green"), 4: ("Ottima! 💪", "darkgreen")
     }
     strength_text, color = strength_map.get(score, ("Sconosciuta", "grey"))
+    return strength_text, full_feedback, score, color
 
-    return strength_text, full_feedback.strip(), score, color
 
+def generate_random_password(length: int, use_upper: bool, use_lower: bool, use_digits: bool, use_symbols: bool,
+                             exclude_ambiguous: bool) -> str:
+    char_pool, guaranteed_chars = [], []
 
-# --- Funzione Generatore Password ---
-def genera_password_casuale(length, use_uppercase, use_lowercase, use_digits, use_symbols, exclude_ambiguous):
-    def filter_ambiguous(char_set_str):
-        if exclude_ambiguous: return "".join(c for c in char_set_str if c not in AMBIGUOUS_CHARACTERS)
-        return char_set_str
+    def filter_ambiguous(char_set: str) -> str:
+        return "".join(c for c in char_set if c not in AMBIGUOUS_CHARACTERS) if exclude_ambiguous else char_set
 
-    s_upper, s_lower, s_digits, s_symbols = filter_ambiguous(string.ascii_uppercase), filter_ambiguous(
-        string.ascii_lowercase), filter_ambiguous(string.digits), filter_ambiguous(string.punctuation)
-    character_pool, guaranteed_chars = "", []
+    sets = {
+        "upper": (use_upper, filter_ambiguous(string.ascii_uppercase)),
+        "lower": (use_lower, filter_ambiguous(string.ascii_lowercase)),
+        "digits": (use_digits, filter_ambiguous(string.digits)),
+        "symbols": (use_symbols, filter_ambiguous(SYMBOLS))
+    }
 
-    if use_uppercase and s_upper: character_pool += s_upper; guaranteed_chars.append(random.choice(s_upper))
-    if use_lowercase and s_lower: character_pool += s_lower; guaranteed_chars.append(random.choice(s_lower))
-    if use_digits and s_digits: character_pool += s_digits; guaranteed_chars.append(random.choice(s_digits))
-    if use_symbols and s_symbols: character_pool += s_symbols; guaranteed_chars.append(random.choice(s_symbols))
+    for use_flag, char_set in sets.values():
+        if use_flag and char_set:
+            char_pool.extend(list(char_set))
+            guaranteed_chars.append(random.choice(char_set))
 
-    if not character_pool: return "Errore: Seleziona tipi di caratteri validi."
-    if length < len(guaranteed_chars): random.shuffle(guaranteed_chars); return "".join(guaranteed_chars[:length])
+    if not char_pool: return ""
 
-    remaining_length = length - len(guaranteed_chars)
-    password_fill = [random.choice(character_pool) for _ in range(remaining_length)]
+    remaining_len = length - len(guaranteed_chars)
+    if remaining_len < 0:
+        random.shuffle(guaranteed_chars)
+        return "".join(guaranteed_chars[:length])
+
+    password_fill = random.choices(char_pool, k=remaining_len)
     final_password_list = guaranteed_chars + password_fill
     random.shuffle(final_password_list)
     return "".join(final_password_list)
 
 
-# --- Gestione Master Password Hashing ---
-def set_master_password_hash(plain_password):
-    salt = bcrypt.gensalt()
-    hashed_password = bcrypt.hashpw(plain_password.encode('utf-8'), salt)
-    with open(MASTER_HASH_FILE, "wb") as f: f.write(hashed_password)
-
-
-def load_master_password_hash():
-    try:
-        with open(MASTER_HASH_FILE, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
-
-
-def verifica_master_password_con_hash(plain_password, stored_hash_bytes):
-    if not plain_password or not stored_hash_bytes: return False
-    try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), stored_hash_bytes)
-    except ValueError:
-        return False
-
-
-# --- Gestione KDF e Chiave di Crittografia ---
-def generate_and_save_kdf_salt():
-    salt = os.urandom(16)
-    with open(KDF_SALT_FILE, "wb") as f: f.write(salt)
-    return salt
-
-
-def load_kdf_salt():
-    try:
-        with open(KDF_SALT_FILE, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
-
-
-def derive_encryption_key(master_password_str, salt_bytes):
-    if not master_password_str or not salt_bytes:
-        raise ValueError("Master password e salt non possono essere vuoti.")
-    password_bytes = master_password_str.encode('utf-8')
-    derived_key_raw = hashlib.pbkdf2_hmac('sha256', password_bytes, salt_bytes, PBKDF2_ITERATIONS, dklen=32)
-    return base64.urlsafe_b64encode(derived_key_raw)
-
-
-def get_cipher_suite_kdf():
-    if "derived_fernet_key" not in st.session_state or not st.session_state.derived_fernet_key:
-        st.error("Chiave crittografia non disponibile. Eseguire login.")
-        return None
-    try:
-        return Fernet(st.session_state.derived_fernet_key)
-    except Exception as e:
-        st.error(f"Errore init cipher suite: {e}"); return None
-
-
-# --- Gestione delle Password (JSON) ---
-def carica_passwords_criptate():
-    try:
-        with open(PASSWORDS_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def salva_passwords_criptate(passwords_criptate):
-    with open(PASSWORDS_FILE, "w") as f: json.dump(passwords_criptate, f, indent=4)
-
-
-def cripta_messaggio(messaggio_bytes):
-    cs = get_cipher_suite_kdf()
-    if not cs: return None
-    return cs.encrypt(messaggio_bytes)
-
-
-def decripta_messaggio(messaggio_criptato_bytes):
-    cs = get_cipher_suite_kdf()
-    if not cs: return None
-    try:
-        return cs.decrypt(messaggio_criptato_bytes)
-    except Exception:
-        return None
-
-
-# --- Interfaccia Streamlit ---
-st.title("🔑 Password Manager Pro")
-st.caption("⚠️ Esempio didattico. Valuta soluzioni professionali per dati critici.")
-
-# Init session state keys
-default_session_keys = {
-    "authenticated": False, "derived_fernet_key": None,
-    "master_password_strength_text": "", "master_password_strength_color": "grey",
-    "master_password_feedback": "", "current_master_setup_pwd": "",
-    "add_servizio_val": "", "add_username_val": "", "add_password_form_input_val": "",  # Valori per i campi di Add
-    "generated_password_value_display_add": ""
-}
-for key, default_value in default_session_keys.items():
-    if key not in st.session_state: st.session_state[key] = default_value
-
-# Chiavi dei widget (non è necessario inizializzarle qui, Streamlit le crea)
-# Solo per riferimento: "new_master_setup_widget_key", "confirm_master_setup_widget_key",
-# "master_pwd_login_widget", "add_servizio_widget", "add_username_widget", "add_pwd_input_widget"
-
-stored_master_hash = load_master_password_hash()
-kdf_salt = load_kdf_salt()
-
-if not stored_master_hash:
-    st.subheader("🔑 Imposta la tua Master Password")
-    st.info("Benvenuto! Configura la tua master password robusta.")
-
-    new_master_pwd_val_typed = st.text_input(  # Leggiamo il valore direttamente dalla chiave del widget al submit
-        "Nuova Master Password:", type="password", key="new_master_setup_widget_key",
-        on_change=lambda: setattr(st.session_state, 'current_master_setup_pwd',
-                                  st.session_state.new_master_setup_widget_key)
-    )
-    if st.session_state.current_master_setup_pwd:
-        strength_text, feedback, _, color = get_password_strength_feedback(st.session_state.current_master_setup_pwd)
-        st.markdown(f"Robustezza: <span style='color:{color}; font-weight:bold;'>{strength_text}</span>. {feedback}",
-                    unsafe_allow_html=True)
-
-    confirm_master_pwd_val_typed = st.text_input("Conferma Master Password:", type="password",
-                                                 key="confirm_master_setup_widget_key")
-
-    if st.button("Imposta e Accedi", key="setup_master_submit_btn"):
-        current_pwd_to_set = st.session_state.current_master_setup_pwd  # Valore da on_change
-        confirm_pwd_to_set = st.session_state.confirm_master_setup_widget_key  # Valore diretto dal widget
-
-        if not current_pwd_to_set or not confirm_pwd_to_set:
-            st.error("Entrambi i campi sono obbligatori.")
-        elif len(current_pwd_to_set) < 12:
-            st.error("Master password min 12 caratteri.")
-        elif current_pwd_to_set != confirm_pwd_to_set:
-            st.error("Le password non coincidono.")
-        else:
-            _, _, score, _ = get_password_strength_feedback(current_pwd_to_set)
-            if score < 3:
-                st.error("Master password troppo debole. Scegline una più robusta.")
-            else:
-                try:
-                    set_master_password_hash(current_pwd_to_set)
-                    current_kdf_salt = generate_and_save_kdf_salt()
-                    fernet_key_for_session = derive_encryption_key(current_pwd_to_set, current_kdf_salt)
-                    st.session_state.derived_fernet_key = fernet_key_for_session
-                    st.session_state.authenticated = True
-                    st.success("Master password impostata! Accesso effettuato.")
-                    st.session_state.current_master_setup_pwd = ""  # Pulisci
-                    # Non è necessario resettare le widget_key qui, verranno ricreate o il loro stato gestito da Streamlit
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Errore: {e}")
-    st.stop()
-
-elif not st.session_state.authenticated:
-    st.subheader("Login")
-    master_password_input_login = st.text_input("Inserisci la Master Password:", type="password",
-                                                key="master_pwd_login_widget")  # Chiave del widget
-    if st.button("Sblocca", key="unlock_btn"):
-        master_pwd_val_login = st.session_state.master_pwd_login_widget  # Leggi dalla chiave del widget
-        if not kdf_salt:
-            st.error("Errore critico: File KDF salt mancante. Resettare l'app.")
-        elif verifica_master_password_con_hash(master_pwd_val_login, stored_master_hash):
-            try:
-                fernet_key_for_session = derive_encryption_key(master_pwd_val_login, kdf_salt)
-                st.session_state.derived_fernet_key = fernet_key_for_session
-                st.session_state.authenticated = True
-                st.success("Accesso effettuato!")
-                # st.session_state.master_pwd_login_widget = "" # Pulisce il campo al prossimo rerun se value non è bindato
-                st.rerun()
-            except ValueError as ve:
-                st.error(f"Errore derivazione chiave: {ve}")
-            except Exception as e:
-                st.error(f"Errore login: {e}")
-        else:
-            st.error("Master Password errata.")
-    st.stop()
-
-# --- SEZIONE AUTENTICATA ---
-st.sidebar.success("Accesso effettuato!")
-if st.sidebar.button("Blocca App", key="lock_app_btn"):
-    st.session_state.authenticated = False
-    st.session_state.derived_fernet_key = None
-    # Pulizia più selettiva o basata su prefissi per evitare di cancellare cose non volute
-    keys_to_clear_on_logout = [
-        "current_master_setup_pwd", "add_servizio_val", "add_username_val",
-        "add_password_form_input_val", "generated_password_value_display_add",
-        "master_pwd_login_widget"  # Per pulire il campo di login se l'utente fa logout e poi login
-    ]
-    for key_prefix_to_delete in ("edit_mode_", "show_pwd_", "edit_user_val_", "edit_pwd_val_"):
-        for k in list(st.session_state.keys()):
-            if k.startswith(key_prefix_to_delete):
-                keys_to_clear_on_logout.append(k)
-
-    for key in keys_to_clear_on_logout:
-        if key in st.session_state:
-            if isinstance(st.session_state[key], str):
-                st.session_state[key] = ""
-            elif isinstance(st.session_state[key], bool):
-                st.session_state[key] = False
-            # Aggiungi altri tipi se necessario, o semplicemente `del st.session_state[key]`
-            # ma questo potrebbe dare errori se si tenta di accedere a una chiave cancellata
-            # prima che sia reinizializzata. Impostare a default è più sicuro.
-    st.rerun()
-
-st.sidebar.markdown("---")
-st.sidebar.header("Menu Principale")
-menu_options = ["➕ Aggiungi Password", "👀 Visualizza/Modifica Password", "🗑️ Elimina Password", "⚙️ Utility Database"]
-scelta = st.sidebar.radio("Naviga:", menu_options, key="main_menu_choice")
-
-passwords_criptate_db = carica_passwords_criptate()
-
-if scelta == "➕ Aggiungi Password":
-    st.header("➕ Aggiungi Nuova Credenziale")
-    st.markdown("#### ✨ Generatore Password Casuale")
-    pwd_length_add = st.slider("Lunghezza:", 8, 64, 16, key="pwd_gen_length_add")
-    cols_gen_add = st.columns(3)
-    with cols_gen_add[0]:
-        use_upper_add = st.checkbox("Maiuscole (A-Z)", True, key="pwd_gen_upper_add")
-    with cols_gen_add[1]:
-        use_digits_add = st.checkbox("Numeri (0-9)", True, key="pwd_gen_digits_add")
-    with cols_gen_add[0]:
-        use_lower_add = st.checkbox("Minuscole (a-z)", True, key="pwd_gen_lower_add")
-    with cols_gen_add[1]:
-        use_symbols_add = st.checkbox("Simboli (!@#$)", True, key="pwd_gen_symbols_add")
-    with cols_gen_add[2]:
-        exclude_ambiguous_add_val = st.checkbox("Escludi Ambigui", True, key="pwd_gen_exclude_ambiguous_add")
-
-    if st.button("Genera Password", key="generate_pwd_btn_add"):
-        if not (use_upper_add or use_lower_add or use_digits_add or use_symbols_add):
-            st.error("Seleziona almeno un tipo di carattere.");
-            st.session_state.generated_password_value_display_add = ""
-        else:
-            st.session_state.generated_password_value_display_add = genera_password_casuale(pwd_length_add,
-                                                                                            use_upper_add,
-                                                                                            use_lower_add,
-                                                                                            use_digits_add,
-                                                                                            use_symbols_add,
-                                                                                            exclude_ambiguous_add_val)
-            st.session_state.add_password_form_input_val = st.session_state.generated_password_value_display_add
-
-    if st.session_state.generated_password_value_display_add:
-        st.code(st.session_state.generated_password_value_display_add)
-        s_text, s_feedback, _, s_color = get_password_strength_feedback(
-            st.session_state.generated_password_value_display_add)
+def display_strength_bar(password: str):
+    """Mostra un indicatore di robustezza per la password data."""
+    if password:
+        strength_text, feedback, _, color = get_password_strength_feedback(password)
         st.markdown(
-            f"Robustezza Generata: <span style='color:{s_color}; font-weight:bold;'>{s_text}</span>. {s_feedback}",
+            f"**Robustezza:** <span style='color:{color}; font-weight:bold;'>{strength_text}</span>. *{feedback}*",
             unsafe_allow_html=True)
-        st.caption("Password suggerita nel campo sottostante (puoi modificarla).")
-    st.markdown("---")
-
-    # --- Form Aggiungi (Senza st.form) ---
-    # I valori sono bindati a st.session_state.add_XXX_val
-    servizio_add_input = st.text_input("Servizio/Sito Web:", value=st.session_state.add_servizio_val,
-                                       key="widget_add_servizio")
-    username_add_input = st.text_input("Username/Email:", value=st.session_state.add_username_val,
-                                       key="widget_add_username")
 
 
-    def cb_update_add_pwd_strength():
-        st.session_state.add_password_form_input_val = st.session_state.widget_add_password
+# --- INTERFACCIA PRINCIPALE STREAMLIT ---
+def main():
+    st.title("🔑 Password Manager Pro")
+    st.caption(
+        "⚠️ Questo è un progetto a scopo didattico. Per dati critici, considera soluzioni professionali e auditate.")
 
+    manager = PasswordManager(MASTER_HASH_FILE, KDF_SALT_FILE, PASSWORDS_FILE)
 
-    nuova_password_add_input = st.text_input("Password:", type="password", key="widget_add_password",
-                                             value=st.session_state.add_password_form_input_val,
-                                             on_change=cb_update_add_pwd_strength)
+    # --- Inizializzazione Session State ---
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if "editing_service" not in st.session_state:
+        st.session_state.editing_service = None  # Semplifica la logica di modifica
 
-    if st.session_state.add_password_form_input_val:  # Mostra robustezza per il campo password
-        s_text, s_feedback, _, s_color = get_password_strength_feedback(st.session_state.add_password_form_input_val)
-        st.markdown(f"Robustezza: <span style='color:{s_color}; font-weight:bold;'>{s_text}</span>. {s_feedback}",
-                    unsafe_allow_html=True)
+    # 1. SETUP INIZIALE (se non esiste la master password)
+    if not manager.master_hash_exists():
+        st.subheader("🔑 Imposta la tua Master Password")
+        st.info("Benvenuto! Crea una password principale robusta. Sarà l'unica che dovrai ricordare.")
 
-    if st.button("Salva Credenziale", key="submit_add_credential_btn"):
-        # Leggi i valori attuali dai widget usando le loro chiavi
-        s_val = st.session_state.widget_add_servizio
-        u_val = st.session_state.widget_add_username
-        p_val = st.session_state.add_password_form_input_val  # Questo è aggiornato da on_change
+        with st.form("setup_form"):
+            new_pwd = st.text_input("Nuova Master Password", type="password")
+            confirm_pwd = st.text_input("Conferma Master Password", type="password")
 
-        if s_val and u_val and p_val:
-            enc_pass = cripta_messaggio(p_val.encode())
-            if enc_pass:
-                passwords_criptate_db[s_val] = {"username": u_val, "password_criptata": enc_pass.decode()}
-                salva_passwords_criptate(passwords_criptate_db)
-                st.success(f"Credenziale per '{s_val}' aggiunta!");
-                # Pulisci le variabili di stato che controllano i valori dei widget
-                st.session_state.add_servizio_val = ""
-                st.session_state.add_username_val = ""
-                st.session_state.add_password_form_input_val = ""
-                st.session_state.generated_password_value_display_add = ""
-                st.rerun()  # Rerun per riflettere i campi puliti
-            else:
-                st.error("Errore crittografia.")
-        else:
-            st.error("Compila tutti i campi.")
+            display_strength_bar(new_pwd)
+            submitted = st.form_submit_button("Imposta e Accedi")
 
-elif scelta == "👀 Visualizza/Modifica Password":
-    st.header("👀 Visualizza e Modifica Credenziali")
-    if not passwords_criptate_db:
-        st.info("Nessuna password salvata.")
-    else:
-        search_term = st.text_input("Cerca per Servizio:", key="search_service_input_main").lower()
-        filtered_credentials = {s: d for s, d in passwords_criptate_db.items() if
-                                search_term in s.lower()} if search_term else passwords_criptate_db
+            if submitted:
+                _, _, score, _ = get_password_strength_feedback(new_pwd)
+                if not new_pwd or not confirm_pwd:
+                    st.error("Entrambi i campi sono obbligatori.")
+                elif len(new_pwd) < 12:
+                    st.error("La Master Password deve essere di almeno 12 caratteri.")
+                elif new_pwd != confirm_pwd:
+                    st.error("Le password non coincidono.")
+                elif score < 3:
+                    st.warning("Password debole. Scegli una combinazione più robusta e lunga.")
+                else:
+                    manager.set_master_hash(new_pwd)
+                    salt = manager.generate_and_save_kdf_salt()
+                    st.session_state.master_password_cache = new_pwd
+                    st.session_state.authenticated = True
+                    st.success("Master Password impostata! Accesso eseguito.")
+                    st.rerun()
 
-        if not filtered_credentials and search_term: st.warning(f"Nessun servizio per '{search_term}'.")
+    # 2. LOGIN (se esiste la master password ma l'utente non è autenticato)
+    elif not st.session_state.authenticated:
+        st.subheader("Login")
+        with st.form("login_form"):
+            master_pwd_input = st.text_input("Inserisci la Master Password", type="password")
+            submitted = st.form_submit_button("Sblocca")
 
-        for servizio, dati in filtered_credentials.items():
-            service_key_suffix = "".join(c if c.isalnum() else "_" for c in servizio)
-            edit_mode_key = f"edit_mode_{service_key_suffix}"
-            if edit_mode_key not in st.session_state: st.session_state[edit_mode_key] = False
-
-            with st.expander(f"🔑 {servizio}", expanded=st.session_state[edit_mode_key]):
-                if st.session_state[edit_mode_key]:
-                    st.markdown(f"#### Modifica: {servizio}")
-
-                    # Chiavi per i valori di session_state che mantengono lo stato del form di modifica
-                    edit_user_sval_key = f"edit_user_val_{service_key_suffix}"
-                    edit_pwd_sval_key = f"edit_pwd_val_{service_key_suffix}"
-                    # Chiavi per i widget stessi
-                    edit_user_widget_key = f"edit_user_widget_{service_key_suffix}"
-                    edit_pwd_widget_key = f"edit_pwd_widget_{service_key_suffix}"
-
-                    # Inizializza i valori di session_state se non esistono (prima volta in edit mode per questa entry)
-                    if edit_user_sval_key not in st.session_state:
-                        st.session_state[edit_user_sval_key] = dati['username']
-                    if edit_pwd_sval_key not in st.session_state:
-                        dec_pass_edit_init = decripta_messaggio(dati['password_criptata'].encode())
-                        st.session_state[edit_pwd_sval_key] = dec_pass_edit_init.decode() if dec_pass_edit_init else ""
-
-
-                    # Callback per aggiornare i valori di session_state quando i widget cambiano
-                    def cb_edit_user():
-                        st.session_state[edit_user_sval_key] = st.session_state[edit_user_widget_key]
-
-
-                    def cb_edit_pwd():
-                        st.session_state[edit_pwd_sval_key] = st.session_state[edit_pwd_widget_key]
-
-
-                    new_username_edit_input = st.text_input("Username/Email:",
-                                                            value=st.session_state[edit_user_sval_key],
-                                                            key=edit_user_widget_key, on_change=cb_edit_user)
-                    new_password_edit_input = st.text_input("Nuova Password:", type="password",
-                                                            value=st.session_state[edit_pwd_sval_key],
-                                                            key=edit_pwd_widget_key, on_change=cb_edit_pwd)
-
-                    if st.session_state[edit_pwd_sval_key]:  # Mostra robustezza per la password in modifica
-                        s_text, s_feedback, _, s_color = get_password_strength_feedback(
-                            st.session_state[edit_pwd_sval_key])
-                        st.markdown(
-                            f"Robustezza: <span style='color:{s_color}; font-weight:bold;'>{s_text}</span>. {s_feedback}",
-                            unsafe_allow_html=True)
-
-                    cols_edit_btns = st.columns(2)
-                    with cols_edit_btns[0]:
-                        if st.button("Salva Modifiche", key=f"save_edit_{service_key_suffix}",
-                                     use_container_width=True):
-                            # Leggi i valori finali dalle variabili di session_state (aggiornate da on_change)
-                            final_username = st.session_state[edit_user_sval_key]
-                            final_pwd = st.session_state[edit_pwd_sval_key]
-
-                            if not final_username:
-                                st.error("L'username non può essere vuoto.")
-                            else:
-                                passwords_criptate_db[servizio]['username'] = final_username
-                                dec_orig_pass_bytes = decripta_messaggio(dati['password_criptata'].encode())
-                                original_password_str = dec_orig_pass_bytes.decode() if dec_orig_pass_bytes else ""
-
-                                if final_pwd != original_password_str:  # Se la password è cambiata
-                                    if not final_pwd:  # Se è stata cancellata, errore
-                                        st.error(
-                                            "Il campo password non può essere vuoto. Per non cambiarla, lasciala com'era.")
-                                    else:  # Altrimenti, cripta e salva la nuova password
-                                        enc_new_pass = cripta_messaggio(final_pwd.encode())
-                                        if enc_new_pass:
-                                            passwords_criptate_db[servizio]['password_criptata'] = enc_new_pass.decode()
-                                        else:
-                                            st.error("Errore crittografia nuova password. Modifiche NON salvate.");
-                                            st.stop()
-
-                                salva_passwords_criptate(passwords_criptate_db)
-                                st.success(f"Credenziale per '{servizio}' aggiornata!")
-                                st.session_state[edit_mode_key] = False
-                                # Pulisci le session_state _val specifiche per questo form di modifica
-                                del st.session_state[edit_user_sval_key]
-                                del st.session_state[edit_pwd_sval_key]
-                                st.rerun()
-                    with cols_edit_btns[1]:
-                        if st.button("Annulla", type="secondary", key=f"cancel_edit_{service_key_suffix}",
-                                     use_container_width=True):
-                            st.session_state[edit_mode_key] = False
-                            # Pulisci le session_state _val specifiche per questo form di modifica
-                            if edit_user_sval_key in st.session_state: del st.session_state[edit_user_sval_key]
-                            if edit_pwd_sval_key in st.session_state: del st.session_state[edit_pwd_sval_key]
-                            st.rerun()
-                else:  # Modalità Visualizzazione
-                    st.text(f"Username/Email: {dati['username']}")
-                    show_pwd_key = f"show_pwd_{service_key_suffix}"
-                    if show_pwd_key not in st.session_state: st.session_state[show_pwd_key] = False
-                    if st.button("Mostra/Nascondi Password", key=f"btn_show_{service_key_suffix}"): st.session_state[
-                        show_pwd_key] = not st.session_state[show_pwd_key]
-
-                    if st.session_state[show_pwd_key]:
-                        dec_pass_disp = decripta_messaggio(dati['password_criptata'].encode())
-                        st.text_input("Password:", value=dec_pass_disp.decode() if dec_pass_disp else "ERRORE DECRIPT",
-                                      type="default", disabled=True, key=f"pwd_vis_{service_key_suffix}")
-                    else:
-                        st.text_input("Password:", value="∗∗∗∗∗∗∗∗∗∗", type="default", disabled=True,
-                                      key=f"pwd_hid_{service_key_suffix}")
-
-                    if st.button("Modifica Credenziale", key=f"btn_edit_{service_key_suffix}", type="secondary"):
-                        st.session_state[edit_mode_key] = True
-                        # Pre-popola i valori di session_state per il form di modifica quando si clicca "Modifica"
-                        st.session_state[f"edit_user_val_{service_key_suffix}"] = dati['username']
-                        dec_pass_btn_edit = decripta_messaggio(dati['password_criptata'].encode())
-                        st.session_state[
-                            f"edit_pwd_val_{service_key_suffix}"] = dec_pass_btn_edit.decode() if dec_pass_btn_edit else ""
-                        st.rerun()
-
-elif scelta == "🗑️ Elimina Password":
-    st.header("🗑️ Elimina Credenziale")
-    if not passwords_criptate_db:
-        st.info("Nessuna password da eliminare.")
-    else:
-        servizi_disponibili = list(passwords_criptate_db.keys())
-        servizio_da_eliminare = st.selectbox("Seleziona il servizio da eliminare:", servizi_disponibili, index=None,
-                                             placeholder="Scegli un servizio...")
-        if servizio_da_eliminare:
-            st.warning(
-                f"Sei sicuro di voler eliminare la credenziale per **{servizio_da_eliminare}**? Questa azione è irreversibile.")
-            if st.button(f"Sì, Elimina Definitivamente '{servizio_da_eliminare}'", type="primary"):
-                if servizio_da_eliminare in passwords_criptate_db:
-                    del passwords_criptate_db[servizio_da_eliminare]
-                    salva_passwords_criptate(passwords_criptate_db)
-                    st.success(f"Credenziale per '{servizio_da_eliminare}' eliminata!")
+            if submitted:
+                if manager.verify_master_password(master_pwd_input):
+                    st.session_state.master_password_cache = master_pwd_input
+                    st.session_state.authenticated = True
+                    st.success("Accesso effettuato!")
                     st.rerun()
                 else:
-                    st.error("Servizio non trovato.")
+                    st.error("Master Password errata.")
 
-elif scelta == "⚙️ Utility Database":
-    st.header("⚙️ Utility Database (Import/Export)")
-    st.markdown("Esporta il tuo database di password criptate o importa un backup esistente.")
-    st.markdown(
-        "⚠️ **Attenzione:** L'import sovrascriverà le credenziali con lo stesso nome di servizio se scegli l'opzione 'Unisci e Sovrascrivi'. Assicurati che il file importato sia stato criptato con la stessa master password (o una derivata KDF compatibile) di quella attualmente in uso, altrimenti le password importate non saranno decriptabili.")
-
-    st.subheader("📤 Esporta Database")
-    if not passwords_criptate_db:
-        st.info("Il database è vuoto. Nulla da esportare.")
+    # 3. APP PRINCIPALE (se l'utente è autenticato)
     else:
-        try:
-            export_data_json = json.dumps(passwords_criptate_db, indent=4)
-            st.download_button(label="Scarica Backup Password (passwords_backup.json)", data=export_data_json,
-                               file_name="passwords_backup.json", mime="application/json")
-        except Exception as e:
-            st.error(f"Errore export: {e}")
+        kdf_salt = manager.load_kdf_salt()
+        if not kdf_salt or 'master_password_cache' not in st.session_state:
+            st.error("Errore di sessione. Eseguire nuovamente il login.")
+            st.session_state.authenticated = False
+            st.rerun()
+            return
 
-    st.markdown("---");
-    st.subheader("📥 Importa Database")
-    uploaded_file = st.file_uploader("Scegli un file di backup (.json):", type="json", key="db_import_uploader")
-    if uploaded_file is not None:
-        try:
-            imported_db = json.loads(uploaded_file.read().decode())
-            if not isinstance(imported_db, dict):
-                st.error("Formato file non valido.")
-            else:
-                valid_entries = all(
-                    isinstance(v, dict) and "username" in v and "password_criptata" in v for v in imported_db.values())
-                if not valid_entries and imported_db:
-                    st.error("File JSON non sembra contenere credenziali valide.")
+        manager.derive_and_set_cipher(st.session_state.master_password_cache, kdf_salt)
+
+        # --- SIDEBAR ---
+        st.sidebar.success("✅ Accesso Eseguito")
+        if st.sidebar.button("Blocca App", use_container_width=True, type="primary"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+        st.sidebar.markdown("---")
+        menu_options = ["👀 Visualizza/Modifica", "➕ Aggiungi Nuova", "⚙️ Utility"]
+        scelta = st.sidebar.radio("Menu", menu_options)
+
+        decrypted_passwords = manager.get_decrypted_passwords()
+        if decrypted_passwords is None:
+            st.error("Impossibile decriptare i dati. La sessione potrebbe essere scaduta.")
+            st.stop()
+
+        # --- SEZIONE VISUALIZZA/MODIFICA/ELIMINA ---
+        if scelta == "👀 Visualizza/Modifica":
+            st.header("Visualizza, Modifica ed Elimina Credenziali")
+            search_term = st.text_input("Cerca per Servizio", placeholder="Es. Google, Amazon...").lower()
+
+            filtered_creds = {s: d for s, d in decrypted_passwords.items() if
+                              search_term in s.lower()} if search_term else decrypted_passwords
+
+            if not filtered_creds:
+                st.info(
+                    "Nessuna credenziale trovata." if not search_term else f"Nessuna credenziale trovata per '{search_term}'.")
+
+            for service, data in filtered_creds.items():
+                if st.session_state.editing_service == service:
+                    with st.expander(f"📝 Modifica: **{service}**", expanded=True):
+                        with st.form(key=f"edit_{service}"):
+                            new_username = st.text_input("Username/Email", value=data['username'])
+                            new_password = st.text_input("Password", value=data['password'], type="password")
+                            display_strength_bar(new_password)
+
+                            c1, c2 = st.columns(2)
+                            if c1.form_submit_button("Salva Modifiche", use_container_width=True, type="primary"):
+                                manager.update_credential(service, new_username, new_password)
+                                st.success(f"Credenziale per '{service}' aggiornata.")
+                                st.session_state.editing_service = None
+                                st.rerun()
+
+                            if c2.form_submit_button("Annulla", use_container_width=True):
+                                st.session_state.editing_service = None
+                                st.rerun()
                 else:
-                    st.success(f"File '{uploaded_file.name}' caricato ({len(imported_db)} voci).")
-                    import_option = st.radio("Modalità di import:",
-                                             ("Unisci (sovrascrivi duplicati)", "Sostituisci database esistente"),
-                                             key="import_mode_radio")
-                    if st.button("Conferma Import", type="primary"):
-                        current_db = carica_passwords_criptate()
-                        final_db = imported_db if import_option == "Sostituisci database esistente" else {**current_db,
-                                                                                                          **imported_db}
-                        salva_passwords_criptate(final_db)
-                        st.success(f"Database importato ('{import_option}').");
-                        st.rerun()
-        except json.JSONDecodeError:
-            st.error("File non è JSON valido.")
-        except Exception as e:
-            st.error(f"Errore import: {e}")
+                    with st.expander(f"🔑 {service}"):
+                        st.text_input("Username/Email", value=data['username'], disabled=True,
+                                      key=f"disp_user_{service}")
+                        st.text_input("Password", value="∗∗∗∗∗∗∗∗∗", disabled=True, key=f"disp_pwd_{service}")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown(f"**Hash Master Pwd:** `{MASTER_HASH_FILE}`")
-st.sidebar.markdown(f"**Salt KDF:** `{KDF_SALT_FILE}`")
-st.sidebar.markdown(f"**Database Password:** `{PASSWORDS_FILE}`")
+                        c1, c2, c3 = st.columns(3)
+                        if c1.button("Mostra Password", key=f"show_{service}"):
+                            st.info(f"**Password per {service}:** `{data['password']}`")
+                        if c2.button("Modifica", key=f"edit_{service}"):
+                            st.session_state.editing_service = service
+                            st.rerun()
+                        if c3.button("🗑️ Elimina", key=f"del_{service}", type="primary"):
+                            manager.delete_credential(service)
+                            st.success(f"Credenziale per '{service}' eliminata.")
+                            st.rerun()
+
+        # --- SEZIONE AGGIUNGI NUOVA ---
+        elif scelta == "➕ Aggiungi Nuova":
+            st.header("Aggiungi Nuova Credenziale")
+
+            with st.expander("✨ Generatore Password", expanded=False):
+                g1, g2 = st.columns(2)
+                length = g1.slider("Lunghezza", 8, 128, 20)
+                exclude_ambiguous = g2.checkbox("Escludi caratteri ambigui (Il1O0|')", True)
+
+                g_opts = st.columns(4)
+                use_upper = g_opts[0].checkbox("Maiuscole (A-Z)", True)
+                use_lower = g_opts[1].checkbox("Minuscole (a-z)", True)
+                use_digits = g_opts[2].checkbox("Numeri (0-9)", True)
+                use_symbols = g_opts[3].checkbox("Simboli (@#$%)", True)
+
+                if st.button("Genera e usa password"):
+                    generated_pwd = generate_random_password(length, use_upper, use_lower, use_digits, use_symbols,
+                                                             exclude_ambiguous)
+                    st.session_state.add_password_value = generated_pwd
+                    st.code(generated_pwd)
+
+            with st.form("add_credential_form"):
+                service = st.text_input("Servizio/Sito Web")
+                username = st.text_input("Username/Email")
+                password = st.text_input("Password", type="password",
+                                         value=st.session_state.get("add_password_value", ""))
+
+                display_strength_bar(password)
+
+                submitted = st.form_submit_button("Salva Credenziale", use_container_width=True, type="primary")
+                if submitted:
+                    if not all([service, username, password]):
+                        st.error("Tutti i campi sono obbligatori.")
+                    elif service in decrypted_passwords:
+                        st.error(
+                            f"Un servizio con nome '{service}' esiste già. Usa un nome diverso o modifica quello esistente.")
+                    else:
+                        if manager.add_credential(service, username, password):
+                            st.success(f"Credenziale per '{service}' aggiunta con successo!")
+                            if 'add_password_value' in st.session_state:
+                                del st.session_state.add_password_value
+                            st.rerun()
+                        else:
+                            st.error("Errore durante il salvataggio della credenziale.")
+
+        # --- SEZIONE UTILITY ---
+        elif scelta == "⚙️ Utility":
+            st.header("Utility Database (Import/Export)")
+            st.warning("Assicurati che il file importato sia stato criptato con la stessa Master Password.")
+
+            st.subheader("📤 Esporta Database")
+            db_data = manager.load_encrypted_db()
+            if not db_data:
+                st.info("Nessun dato da esportare.")
+            else:
+                st.download_button(
+                    label="Scarica Backup Criptato (.json)",
+                    data=json.dumps(db_data, indent=4),
+                    file_name="password_manager_backup.json",
+                    mime="application/json"
+                )
+
+            st.subheader("📥 Importa Database")
+            uploaded_file = st.file_uploader("Carica un file di backup (.json)", type="json")
+            if uploaded_file:
+                try:
+                    imported_data = json.load(uploaded_file)
+                    st.success(f"File '{uploaded_file.name}' caricato con {len(imported_data)} voci.")
+
+                    if st.button("Sostituisci Database con l'Importazione", type="primary"):
+                        manager.save_encrypted_db(imported_data)
+                        st.success("Database importato con successo!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Errore durante l'importazione: {e}")
+
+
+if __name__ == "__main__":
+    main()
