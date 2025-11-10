@@ -6,6 +6,8 @@ import base64
 import hashlib
 import random
 import string
+import pyotp  # <-- NUOVO
+import time  # <-- NUOVO
 from cryptography.fernet import Fernet
 from zxcvbn import zxcvbn
 from typing import Dict, Any, Optional, Tuple, List
@@ -35,7 +37,7 @@ class PasswordManager:
         self.db_file = db_file
         self.cipher_suite: Optional[Fernet] = None
 
-    # ... (metodi per hash, salt, KDF rimangono invariati) ...
+    # ... (metodi hash, salt, KDF...) ...
     def master_hash_exists(self) -> bool:
         return os.path.exists(self.hash_file)
 
@@ -94,31 +96,45 @@ class PasswordManager:
         for service, credentials in encrypted_db.items():
             try:
                 decrypted_password = self.cipher_suite.decrypt(credentials['password_criptata'].encode()).decode()
+
+                # NUOVA LOGICA TOTP
+                decrypted_totp = ""
+                if credentials.get("totp_secret_criptato"):
+                    decrypted_totp = self.cipher_suite.decrypt(credentials['totp_secret_criptato'].encode()).decode()
+
                 decrypted_data[service] = {
                     "username": credentials['username'],
                     "password": decrypted_password,
-                    "last_updated": credentials.get("last_updated")  # Aggiunto per compatibilità
+                    "last_updated": credentials.get("last_updated"),
+                    "totp_secret": decrypted_totp  # Aggiunto
                 }
             except Exception:
                 decrypted_data[service] = {"password": "ERRORE DI DECRIPTAZIONE"}
         return decrypted_data
 
-    def add_credential(self, service: str, username: str, password: str) -> bool:
+    def add_credential(self, service: str, username: str, password: str, totp_secret: str = "") -> bool:
         if not self.cipher_suite: return False
 
         encrypted_password = self.cipher_suite.encrypt(password.encode()).decode()
+
+        # NUOVA LOGICA TOTP
+        encrypted_totp = ""
+        if totp_secret:
+            encrypted_totp = self.cipher_suite.encrypt(totp_secret.encode()).decode()
+
         db = self.load_encrypted_db()
         db[service] = {
             "username": username,
             "password_criptata": encrypted_password,
-            "last_updated": datetime.now().isoformat()  # NUOVO: Aggiunge timestamp
+            "last_updated": datetime.now().isoformat(),
+            "totp_secret_criptato": encrypted_totp  # Aggiunto
         }
         self.save_encrypted_db(db)
         return True
 
-    def update_credential(self, service: str, new_username: str, new_password: str) -> bool:
-        # L'aggiornamento ora rinnova anche il timestamp
-        return self.add_credential(service, new_username, new_password)
+    def update_credential(self, service: str, new_username: str, new_password: str, new_totp_secret: str = "") -> bool:
+        # L'aggiornamento ora rinnova anche il timestamp e il TOTP
+        return self.add_credential(service, new_username, new_password, new_totp_secret)
 
     def delete_credential(self, service: str) -> None:
         db = self.load_encrypted_db()
@@ -126,78 +142,71 @@ class PasswordManager:
             del db[service]
             self.save_encrypted_db(db)
 
-    # --- NUOVO METODO: CAMBIO MASTER PASSWORD ---
     def change_master_password(self, old_password: str, new_password: str) -> Tuple[bool, str]:
-        """
-        Decripta l'intero database con la vecchia password e lo ri-cripta
-        con la nuova password. Genera anche un nuovo hash master e un nuovo salt KDF.
-        """
-        # 1. Verifica che la vecchia password sia corretta
         if not self.verify_master_password(old_password):
             return False, "La vecchia Master Password è errata."
 
-        # --- FASE DI DECRIPTAZIONE (con la vecchia chiave) ---
         old_salt = self.load_kdf_salt()
         if not old_salt:
             return False, "File salt KDF non trovato. Annullamento."
 
-        # Crea un cipher temporaneo con la vecchia password e il vecchio salt
         old_key = hashlib.pbkdf2_hmac('sha256', old_password.encode('utf-8'), old_salt, PBKDF2_ITERATIONS, dklen=32)
         old_fernet_key = base64.urlsafe_b64encode(old_key)
         old_cipher = Fernet(old_fernet_key)
 
-        # Carica il database criptato
         encrypted_db = self.load_encrypted_db()
         decrypted_data_map = {}
 
-        # Decripta tutto in memoria
         for service, credentials in encrypted_db.items():
             try:
                 decrypted_password = old_cipher.decrypt(credentials['password_criptata'].encode()).decode()
+
+                # LOGICA TOTP AGGIORNATA
+                decrypted_totp = ""
+                if credentials.get("totp_secret_criptato"):
+                    decrypted_totp = old_cipher.decrypt(credentials['totp_secret_criptato'].encode()).decode()
+
                 decrypted_data_map[service] = {
                     "username": credentials['username'],
                     "password": decrypted_password,
+                    "totp_secret": decrypted_totp,  # Aggiunto
                     "last_updated": credentials.get("last_updated")
                 }
             except Exception:
                 return False, f"Errore di decriptazione per '{service}'. Annullamento."
 
-        # --- FASE DI RI-CRITTOGRAFIA (con la nuova chiave) ---
-
-        # 1. Imposta il nuovo hash della Master Password
         self.set_master_hash(new_password)
-
-        # 2. Genera e salva un *nuovo* salt KDF
         new_salt = self.generate_and_save_kdf_salt()
-
-        # 3. Crea un nuovo cipher con la nuova password e il nuovo salt
         new_key = hashlib.pbkdf2_hmac('sha256', new_password.encode('utf-8'), new_salt, PBKDF2_ITERATIONS, dklen=32)
         new_fernet_key = base64.urlsafe_b64encode(new_key)
         new_cipher = Fernet(new_fernet_key)
 
-        # 4. Ricostruisci il DB criptato
         new_encrypted_db = {}
         for service, data in decrypted_data_map.items():
             try:
                 encrypted_password = new_cipher.encrypt(data['password'].encode()).decode()
+
+                # LOGICA TOTP AGGIORNATA
+                encrypted_totp = ""
+                if data.get("totp_secret"):
+                    encrypted_totp = new_cipher.encrypt(data['totp_secret'].encode()).decode()
+
                 new_encrypted_db[service] = {
                     "username": data['username'],
                     "password_criptata": encrypted_password,
+                    "totp_secret_criptato": encrypted_totp,  # Aggiunto
                     "last_updated": data.get("last_updated") or datetime.now().isoformat()
                 }
             except Exception as e:
                 return False, f"Errore durante la ri-crittografia per '{service}': {e}"
 
-        # 5. Salva il nuovo database
         self.save_encrypted_db(new_encrypted_db)
-
-        # 6. Aggiorna il cipher della sessione corrente
         self.cipher_suite = new_cipher
 
         return True, "Master Password cambiata con successo!"
 
 
-# --- (Funzioni Helper UI rimangono invariate) ---
+# --- Funzioni Helper UI ---
 def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:
     if not password: return "", "", 0, "grey"
     results = zxcvbn(password)
@@ -216,7 +225,6 @@ def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:
 
 def generate_random_password(length: int, use_upper: bool, use_lower: bool, use_digits: bool, use_symbols: bool,
                              exclude_ambiguous: bool) -> str:
-    # ... (logica invariata)
     char_pool, guaranteed_chars = [], []
 
     def filter_ambiguous(char_set: str) -> str:
@@ -249,6 +257,22 @@ def display_strength_bar(password: str):
         st.markdown(
             f"**Robustezza:** <span style='color:{color}; font-weight:bold;'>{strength_text}</span>. *{feedback}*",
             unsafe_allow_html=True)
+
+
+# --- NUOVA FUNZIONE HELPER TOTP ---
+def generate_totp_code(secret: str) -> Tuple[Optional[str], int]:
+    """Genera il codice TOTP corrente e il tempo rimanente."""
+    if not secret:
+        return None, 0
+    try:
+        totp = pyotp.TOTP(secret)
+        code = totp.now()
+        # Calcola il tempo rimanente prima della prossima scadenza
+        remaining_time = totp.interval - (datetime.now().timestamp() % totp.interval)
+        return code, int(remaining_time)
+    except Exception:
+        # Spesso accade se il segreto ha un padding o un formato errato
+        return "Errore", 0
 
 
 # --- INTERFACCIA PRINCIPALE STREAMLIT ---
@@ -331,9 +355,7 @@ def main():
             st.error("Impossibile decriptare i dati.")
             st.stop()
 
-        # --- (Sezioni Visualizza, Aggiungi sono invariate) ---
         if scelta == "👀 Visualizza/Modifica":
-            # ... (codice invariato con il toggle mostra/nascondi)
             st.header("Visualizza, Modifica ed Elimina Credenziali")
             search_term = st.text_input("Cerca per Servizio", placeholder="Es. Google, Amazon...").lower()
             filtered_creds = {s: d for s, d in decrypted_passwords.items() if
@@ -343,14 +365,22 @@ def main():
                 show_password_key = f"show_pwd_{service}"
                 if show_password_key not in st.session_state: st.session_state[show_password_key] = False
                 if st.session_state.editing_service == service:
+                    # --- VISTA MODIFICA (AGGIORNATA) ---
                     with st.expander(f"📝 Modifica: **{service}**", expanded=True):
                         with st.form(key=f"edit_{service}"):
                             new_username = st.text_input("Username/Email", value=data['username'])
                             new_password = st.text_input("Password", value=data.get('password', ''), type="password")
                             display_strength_bar(new_password)
+                            # NUOVO CAMPO TOTP
+                            new_totp_secret = st.text_input("Segreto TOTP (opzionale)",
+                                                            value=data.get('totp_secret', ''),
+                                                            type="password",
+                                                            help="Incolla la chiave segreta 2FA. Lascia vuoto per rimuovere.")
+
                             c1, c2 = st.columns(2)
                             if c1.form_submit_button("Salva Modifiche", use_container_width=True, type="primary"):
-                                manager.update_credential(service, new_username, new_password)
+                                manager.update_credential(service, new_username, new_password,
+                                                          new_totp_secret)  # Aggiornato
                                 st.success(f"Credenziale per '{service}' aggiornata.")
                                 st.session_state.editing_service = None
                                 st.rerun()
@@ -358,18 +388,39 @@ def main():
                                 st.session_state.editing_service = None
                                 st.rerun()
                 else:
+                    # --- VISTA VISUALIZZA (AGGIORNATA) ---
                     with st.expander(f"🔑 {service}"):
                         st.text_input("Username/Email", value=data['username'], disabled=True)
                         is_visible = st.session_state[show_password_key]
                         password_to_display = data.get('password', 'ERRORE') if is_visible else "∗∗∗∗∗∗∗∗∗"
                         st.text_input("Password", value=password_to_display, disabled=True, key=f"disp_pwd_{service}")
+
+                        # --- NUOVA SEZIONE TOTP ---
+                        if data.get("totp_secret"):
+                            st.markdown("---")
+                            totp_container = st.container()
+                            code, remaining = generate_totp_code(data['totp_secret'])
+
+                            if code == "Errore":
+                                totp_container.error("Formato segreto TOTP non valido.")
+                            elif code:
+                                totp_container.metric(label="Codice 2FA", value=f"{code}")
+                                totp_container.progress(remaining / 30.0, text=f"Nuovo codice tra {remaining}s")
+                                if totp_container.button("🔄 Aggiorna Codice", key=f"refresh_totp_{service}",
+                                                         help="Forza l'aggiornamento del codice"):
+                                    st.rerun()
+                            else:
+                                totp_container.info("Errore sconosciuto nella generazione TOTP.")
+                        # --- FINE SEZIONE TOTP ---
+
+                        st.markdown("---")  # Separatore visuale
                         c1, c2, c3 = st.columns(3)
                         button_label = "Nascondi Password" if is_visible else "Mostra Password"
                         if c1.button(button_label, key=f"toggle_{service}"):
                             st.session_state[show_password_key] = not st.session_state[show_password_key]
                             st.rerun()
                         if c2.button("Modifica", key=f"edit_{service}"):
-                            st.session_state[show_password_key] = False
+                            st.session_state[show_password_key] = False  # Nascondi pwd prima di modificare
                             st.session_state.editing_service = service
                             st.rerun()
                         if c3.button("🗑️ Elimina", key=f"del_{service}", type="primary"):
@@ -378,7 +429,6 @@ def main():
                             st.rerun()
 
         elif scelta == "➕ Aggiungi Nuova":
-            # ... (codice aggiungi invariato)
             st.header("Aggiungi Nuova Credenziale")
             with st.expander("✨ Generatore Password"):
                 g1, g2 = st.columns(2)
@@ -394,32 +444,38 @@ def main():
                                                                                    use_digits, use_symbols,
                                                                                    exclude_ambiguous)
             if 'add_password_value' in st.session_state: st.code(st.session_state.add_password_value)
+
+            # --- FORM AGGIUNGI (AGGIORNATO) ---
             with st.form("add_credential_form"):
                 service = st.text_input("Servizio/Sito Web")
                 username = st.text_input("Username/Email")
                 password = st.text_input("Password", type="password",
                                          value=st.session_state.get("add_password_value", ""))
                 display_strength_bar(password)
+
+                # NUOVO CAMPO TOTP
+                totp_secret = st.text_input("Segreto TOTP (opzionale)",
+                                            type="password",
+                                            help="Incolla qui la chiave segreta fornita dal servizio per il 2FA.")
+
                 submitted = st.form_submit_button("Salva Credenziale", use_container_width=True, type="primary")
                 if submitted:
                     if not all([service, username, password]):
-                        st.error("Tutti i campi sono obbligatori.")
+                        st.error("I campi Servizio, Username e Password sono obbligatori.")
                     elif service in decrypted_passwords:
                         st.error(f"Un servizio con nome '{service}' esiste già.")
                     else:
-                        if manager.add_credential(service, username, password):
+                        if manager.add_credential(service, username, password, totp_secret):  # Aggiornato
                             st.success(f"Credenziale per '{service}' aggiunta!")
                             if 'add_password_value' in st.session_state: del st.session_state.add_password_value
                             st.rerun()
                         else:
                             st.error("Errore durante il salvataggio.")
 
-        # --- (Sezione Dashboard Sicurezza invariata) ---
         elif scelta == "🛡️ Dashboard Sicurezza":
+            # ... (codice dashboard invariato) ...
             st.header("🛡️ Dashboard di Sicurezza")
             st.info("Questa sezione analizza le tue password per identificare potenziali rischi.")
-
-            # 1. Analisi Password Riutilizzate
             with st.expander("🚨 Password Riutilizzate", expanded=True):
                 password_map = {}
                 for service, data in decrypted_passwords.items():
@@ -428,9 +484,7 @@ def main():
                     if pwd not in password_map:
                         password_map[pwd] = []
                     password_map[pwd].append(service)
-
                 reused_passwords = {pwd: services for pwd, services in password_map.items() if len(services) > 1}
-
                 if not reused_passwords:
                     st.success("Ottimo! Nessuna password riutilizzata trovata.")
                 else:
@@ -438,25 +492,20 @@ def main():
                         f"Trovate {len(reused_passwords)} password riutilizzate. È fondamentale usare una password unica per ogni servizio.")
                     for pwd, services in reused_passwords.items():
                         st.warning(f"La password usata per **{', '.join(services)}** è la stessa.")
-
-            # 2. Analisi Password Deboli
             with st.expander("😟 Password Deboli", expanded=True):
                 weak_passwords = []
                 for service, data in decrypted_passwords.items():
                     pwd = data.get('password')
                     if not pwd or "ERRORE" in pwd: continue
                     strength = zxcvbn(pwd)
-                    if strength['score'] < 3:  # Considera deboli le password con score 0, 1, 2
+                    if strength['score'] < 3:
                         weak_passwords.append((service, strength['score']))
-
                 if not weak_passwords:
                     st.success("Perfetto! Tutte le tue password sono robuste.")
                 else:
                     st.error(f"Trovate {len(weak_passwords)} password deboli o molto deboli.")
                     for service, score in weak_passwords:
                         st.warning(f"La password per **{service}** ha un punteggio di robustezza basso ({score}/4).")
-
-            # 3. Analisi Password Anziane
             with st.expander("🗓️ Password Anziane (più di 1 anno)", expanded=True):
                 old_passwords = []
                 one_year_ago = datetime.now() - timedelta(days=365)
@@ -466,7 +515,6 @@ def main():
                         last_updated_date = datetime.fromisoformat(last_updated_str)
                         if last_updated_date < one_year_ago:
                             old_passwords.append(service)
-
                 if not old_passwords:
                     st.success("Tutte le tue password sono state aggiornate di recente.")
                 else:
@@ -475,11 +523,9 @@ def main():
                     for service in old_passwords:
                         st.markdown(f"- **{service}**")
 
-        # --- SEZIONE UTILITY (AGGIORNATA) ---
         elif scelta == "⚙️ Utility":
+            # ... (codice utility con cambio master password invariato) ...
             st.header("Utility Database")
-
-            # --- SEZIONE IMPORT/EXPORT (Invariata) ---
             st.subheader("📤 Esporta Database")
             st.warning("Assicurati che il file importato sia stato criptato con la stessa Master Password.")
             db_data = manager.load_encrypted_db()
@@ -488,7 +534,6 @@ def main():
             else:
                 st.download_button("Scarica Backup Criptato (.json)", json.dumps(db_data, indent=4),
                                    "password_backup.json", "application/json")
-
             st.subheader("📥 Importa Database")
             uploaded_file = st.file_uploader("Carica un file di backup (.json)", type="json")
             if uploaded_file:
@@ -501,26 +546,17 @@ def main():
                         st.rerun()
                 except Exception as e:
                     st.error(f"Errore durante l'importazione: {e}")
-
             st.markdown("---")
-
-            # --- NUOVA SEZIONE: CAMBIA MASTER PASSWORD ---
             st.subheader("🔑 Cambia Master Password")
             st.error("ATTENZIONE: Questa operazione è irreversibile. L'intero database verrà ri-criptato.")
-
             with st.form("change_master_pwd_form"):
                 old_pwd = st.text_input("Vecchia Master Password", type="password",
                                         help="Inserisci la password che stai usando ora.")
                 new_pwd = st.text_input("Nuova Master Password", type="password")
                 confirm_pwd = st.text_input("Conferma Nuova Master Password", type="password")
-
-                # Mostra la robustezza della *nuova* password
                 display_strength_bar(new_pwd)
-
                 submitted = st.form_submit_button("Cambia Master Password Ora", type="primary")
-
                 if submitted:
-                    # Validazioni UI
                     if not old_pwd or not new_pwd or not confirm_pwd:
                         st.error("Tutti i campi sono obbligatori.")
                     elif new_pwd != confirm_pwd:
@@ -529,18 +565,14 @@ def main():
                         st.error(
                             "La 'Vecchia Master Password' inserita non corrisponde a quella della sessione corrente.")
                     else:
-                        # Controllo robustezza
                         _, _, score, _ = get_password_strength_feedback(new_pwd)
                         if score < 3:
                             st.warning("La nuova password è troppo debole. Scegli una combinazione più robusta.")
                         else:
-                            # Esegui l'operazione
                             st.info("Sto cambiando la Master Password... Questo potrebbe richiedere un momento.")
                             success, message = manager.change_master_password(old_pwd, new_pwd)
-
                             if success:
                                 st.success(message)
-                                # Aggiorna la cache della sessione con la nuova password
                                 st.session_state.master_password_cache = new_pwd
                                 st.info("La sessione è stata aggiornata. Non è necessario un nuovo login.")
                                 st.rerun()
