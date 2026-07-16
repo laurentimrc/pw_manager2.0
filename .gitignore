@@ -1,0 +1,16 @@
+# File sensibili generati a runtime dall'app
+passwords.json
+master_pwd.hash
+kdf.salt
+password_backup.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.idea/

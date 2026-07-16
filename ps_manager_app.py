@@ -1,17 +1,14 @@
 import streamlit as st
 import json
-import os
-import bcrypt
-import base64
-import hashlib
-import random
-import string
-import pyotp  # <-- NUOVO
-import time  # <-- NUOVO
-from cryptography.fernet import Fernet
-from zxcvbn import zxcvbn
-from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timedelta
+
+from password_manager import (
+    PasswordManager,
+    get_password_strength_feedback,
+    generate_random_password,
+    generate_totp_code,
+    validate_imported_db,
+)
 
 # --- CONFIGURAZIONE INIZIALE STREAMLIT ---
 st.set_page_config(page_title="Password Manager Pro", layout="wide", initial_sidebar_state="expanded")
@@ -20,235 +17,9 @@ st.set_page_config(page_title="Password Manager Pro", layout="wide", initial_sid
 PASSWORDS_FILE = "passwords.json"
 MASTER_HASH_FILE = "master_pwd.hash"
 KDF_SALT_FILE = "kdf.salt"
-PBKDF2_ITERATIONS = 600000
-SYMBOLS = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
-AMBIGUOUS_CHARACTERS = "Il1O0|'`"
-
-
-# --- CLASSE DI GESTIONE LOGICA ---
-class PasswordManager:
-    """
-    Incapsula tutta la logica di gestione delle password.
-    """
-
-    def __init__(self, hash_file: str, salt_file: str, db_file: str):
-        self.hash_file = hash_file
-        self.salt_file = salt_file
-        self.db_file = db_file
-        self.cipher_suite: Optional[Fernet] = None
-
-    # ... (metodi hash, salt, KDF...) ...
-    def master_hash_exists(self) -> bool:
-        return os.path.exists(self.hash_file)
-
-    def load_master_hash(self) -> Optional[bytes]:
-        if not self.master_hash_exists(): return None
-        with open(self.hash_file, "rb") as f:
-            return f.read()
-
-    def set_master_hash(self, password: str) -> None:
-        salt = bcrypt.gensalt()
-        hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt)
-        with open(self.hash_file, "wb") as f:
-            f.write(hashed_password)
-
-    def verify_master_password(self, password: str) -> bool:
-        stored_hash = self.load_master_hash()
-        if not password or not stored_hash: return False
-        try:
-            return bcrypt.checkpw(password.encode('utf-8'), stored_hash)
-        except ValueError:
-            return False
-
-    def load_kdf_salt(self) -> Optional[bytes]:
-        if not os.path.exists(self.salt_file): return None
-        with open(self.salt_file, "rb") as f:
-            return f.read()
-
-    def generate_and_save_kdf_salt(self) -> bytes:
-        salt = os.urandom(16)
-        with open(self.salt_file, "wb") as f:
-            f.write(salt)
-        return salt
-
-    def derive_and_set_cipher(self, master_password: str, salt: bytes) -> None:
-        key = hashlib.pbkdf2_hmac('sha256', master_password.encode('utf-8'), salt, PBKDF2_ITERATIONS, dklen=32)
-        fernet_key = base64.urlsafe_b64encode(key)
-        self.cipher_suite = Fernet(fernet_key)
-
-    # --- Gestione Database ---
-    def load_encrypted_db(self) -> Dict[str, Any]:
-        try:
-            with open(self.db_file, "r") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    def save_encrypted_db(self, data: Dict[str, Any]) -> None:
-        with open(self.db_file, "w") as f:
-            json.dump(data, f, indent=4)
-
-    def get_decrypted_passwords(self) -> Optional[Dict[str, Dict[str, str]]]:
-        if not self.cipher_suite: return None
-
-        encrypted_db = self.load_encrypted_db()
-        decrypted_data = {}
-        for service, credentials in encrypted_db.items():
-            try:
-                decrypted_password = self.cipher_suite.decrypt(credentials['password_criptata'].encode()).decode()
-
-                # NUOVA LOGICA TOTP
-                decrypted_totp = ""
-                if credentials.get("totp_secret_criptato"):
-                    decrypted_totp = self.cipher_suite.decrypt(credentials['totp_secret_criptato'].encode()).decode()
-
-                decrypted_data[service] = {
-                    "username": credentials['username'],
-                    "password": decrypted_password,
-                    "last_updated": credentials.get("last_updated"),
-                    "totp_secret": decrypted_totp  # Aggiunto
-                }
-            except Exception:
-                decrypted_data[service] = {"password": "ERRORE DI DECRIPTAZIONE"}
-        return decrypted_data
-
-    def add_credential(self, service: str, username: str, password: str, totp_secret: str = "") -> bool:
-        if not self.cipher_suite: return False
-
-        encrypted_password = self.cipher_suite.encrypt(password.encode()).decode()
-
-        # NUOVA LOGICA TOTP
-        encrypted_totp = ""
-        if totp_secret:
-            encrypted_totp = self.cipher_suite.encrypt(totp_secret.encode()).decode()
-
-        db = self.load_encrypted_db()
-        db[service] = {
-            "username": username,
-            "password_criptata": encrypted_password,
-            "last_updated": datetime.now().isoformat(),
-            "totp_secret_criptato": encrypted_totp  # Aggiunto
-        }
-        self.save_encrypted_db(db)
-        return True
-
-    def update_credential(self, service: str, new_username: str, new_password: str, new_totp_secret: str = "") -> bool:
-        # L'aggiornamento ora rinnova anche il timestamp e il TOTP
-        return self.add_credential(service, new_username, new_password, new_totp_secret)
-
-    def delete_credential(self, service: str) -> None:
-        db = self.load_encrypted_db()
-        if service in db:
-            del db[service]
-            self.save_encrypted_db(db)
-
-    def change_master_password(self, old_password: str, new_password: str) -> Tuple[bool, str]:
-        if not self.verify_master_password(old_password):
-            return False, "La vecchia Master Password è errata."
-
-        old_salt = self.load_kdf_salt()
-        if not old_salt:
-            return False, "File salt KDF non trovato. Annullamento."
-
-        old_key = hashlib.pbkdf2_hmac('sha256', old_password.encode('utf-8'), old_salt, PBKDF2_ITERATIONS, dklen=32)
-        old_fernet_key = base64.urlsafe_b64encode(old_key)
-        old_cipher = Fernet(old_fernet_key)
-
-        encrypted_db = self.load_encrypted_db()
-        decrypted_data_map = {}
-
-        for service, credentials in encrypted_db.items():
-            try:
-                decrypted_password = old_cipher.decrypt(credentials['password_criptata'].encode()).decode()
-
-                # LOGICA TOTP AGGIORNATA
-                decrypted_totp = ""
-                if credentials.get("totp_secret_criptato"):
-                    decrypted_totp = old_cipher.decrypt(credentials['totp_secret_criptato'].encode()).decode()
-
-                decrypted_data_map[service] = {
-                    "username": credentials['username'],
-                    "password": decrypted_password,
-                    "totp_secret": decrypted_totp,  # Aggiunto
-                    "last_updated": credentials.get("last_updated")
-                }
-            except Exception:
-                return False, f"Errore di decriptazione per '{service}'. Annullamento."
-
-        self.set_master_hash(new_password)
-        new_salt = self.generate_and_save_kdf_salt()
-        new_key = hashlib.pbkdf2_hmac('sha256', new_password.encode('utf-8'), new_salt, PBKDF2_ITERATIONS, dklen=32)
-        new_fernet_key = base64.urlsafe_b64encode(new_key)
-        new_cipher = Fernet(new_fernet_key)
-
-        new_encrypted_db = {}
-        for service, data in decrypted_data_map.items():
-            try:
-                encrypted_password = new_cipher.encrypt(data['password'].encode()).decode()
-
-                # LOGICA TOTP AGGIORNATA
-                encrypted_totp = ""
-                if data.get("totp_secret"):
-                    encrypted_totp = new_cipher.encrypt(data['totp_secret'].encode()).decode()
-
-                new_encrypted_db[service] = {
-                    "username": data['username'],
-                    "password_criptata": encrypted_password,
-                    "totp_secret_criptato": encrypted_totp,  # Aggiunto
-                    "last_updated": data.get("last_updated") or datetime.now().isoformat()
-                }
-            except Exception as e:
-                return False, f"Errore durante la ri-crittografia per '{service}': {e}"
-
-        self.save_encrypted_db(new_encrypted_db)
-        self.cipher_suite = new_cipher
-
-        return True, "Master Password cambiata con successo!"
-
-
-# --- Funzioni Helper UI ---
-def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:
-    if not password: return "", "", 0, "grey"
-    results = zxcvbn(password)
-    score = results['score']
-    feedback_text = results.get('feedback', {}).get('warning', '')
-    suggestions = " ".join(results.get('feedback', {}).get('suggestions', []))
-    full_feedback = f"{feedback_text} {suggestions}".strip()
-
-    strength_map = {
-        0: ("Pessima 😱", "red"), 1: ("Debole 😟", "orange"), 2: ("Discreta 🤔", "yellow"),
-        3: ("Buona 😊", "green"), 4: ("Ottima! 💪", "darkgreen")
-    }
-    strength_text, color = strength_map.get(score, ("Sconosciuta", "grey"))
-    return strength_text, full_feedback, score, color
-
-
-def generate_random_password(length: int, use_upper: bool, use_lower: bool, use_digits: bool, use_symbols: bool,
-                             exclude_ambiguous: bool) -> str:
-    char_pool, guaranteed_chars = [], []
-
-    def filter_ambiguous(char_set: str) -> str:
-        return "".join(c for c in char_set if c not in AMBIGUOUS_CHARACTERS) if exclude_ambiguous else char_set
-
-    sets = {
-        "upper": (use_upper, filter_ambiguous(string.ascii_uppercase)),
-        "lower": (use_lower, filter_ambiguous(string.ascii_lowercase)),
-        "digits": (use_digits, filter_ambiguous(string.digits)),
-        "symbols": (use_symbols, filter_ambiguous(SYMBOLS))
-    }
-    for use_flag, char_set in sets.values():
-        if use_flag and char_set:
-            char_pool.extend(list(char_set))
-            guaranteed_chars.append(random.choice(char_set))
-    if not char_pool: return ""
-    remaining_len = length - len(guaranteed_chars)
-    if remaining_len < 0:
-        random.shuffle(guaranteed_chars)
-        return "".join(guaranteed_chars[:length])
-    password_fill = random.choices(char_pool, k=remaining_len)
-    final_password_list = guaranteed_chars + password_fill
-    random.shuffle(final_password_list)
-    return "".join(final_password_list)
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 60
+SESSION_INACTIVITY_TIMEOUT_SECONDS = 15 * 60
 
 
 def display_strength_bar(password: str):
@@ -257,22 +28,6 @@ def display_strength_bar(password: str):
         st.markdown(
             f"**Robustezza:** <span style='color:{color}; font-weight:bold;'>{strength_text}</span>. *{feedback}*",
             unsafe_allow_html=True)
-
-
-# --- NUOVA FUNZIONE HELPER TOTP ---
-def generate_totp_code(secret: str) -> Tuple[Optional[str], int]:
-    """Genera il codice TOTP corrente e il tempo rimanente."""
-    if not secret:
-        return None, 0
-    try:
-        totp = pyotp.TOTP(secret)
-        code = totp.now()
-        # Calcola il tempo rimanente prima della prossima scadenza
-        remaining_time = totp.interval - (datetime.now().timestamp() % totp.interval)
-        return code, int(remaining_time)
-    except Exception:
-        # Spesso accade se il segreto ha un padding o un formato errato
-        return "Errore", 0
 
 
 # --- INTERFACCIA PRINCIPALE STREAMLIT ---
@@ -316,19 +71,43 @@ def main():
                     st.rerun()
 
     elif not st.session_state.authenticated:
-        # ... (codice login invariato)
         st.subheader("Login")
-        with st.form("login_form"):
-            master_pwd_input = st.text_input("Inserisci la Master Password", type="password")
-            submitted = st.form_submit_button("Sblocca")
-            if submitted:
-                if manager.verify_master_password(master_pwd_input):
-                    st.session_state.master_password_cache = master_pwd_input
-                    st.session_state.authenticated = True
-                    st.success("Accesso effettuato!")
-                    st.rerun()
-                else:
-                    st.error("Master Password errata.")
+
+        failed_attempts = st.session_state.get("failed_login_attempts", 0)
+        lockout_until = st.session_state.get("login_lockout_until")
+        now = datetime.now()
+
+        if lockout_until and now < lockout_until:
+            remaining = int((lockout_until - now).total_seconds())
+            st.error(f"Troppi tentativi falliti. Riprova tra {remaining} secondi.")
+        else:
+            if lockout_until and now >= lockout_until:
+                st.session_state.failed_login_attempts = 0
+                st.session_state.login_lockout_until = None
+
+            with st.form("login_form"):
+                master_pwd_input = st.text_input("Inserisci la Master Password", type="password")
+                submitted = st.form_submit_button("Sblocca")
+                if submitted:
+                    if manager.verify_master_password(master_pwd_input):
+                        st.session_state.master_password_cache = master_pwd_input
+                        st.session_state.authenticated = True
+                        st.session_state.failed_login_attempts = 0
+                        st.session_state.login_lockout_until = None
+                        st.session_state.last_activity = datetime.now()
+                        st.success("Accesso effettuato!")
+                        st.rerun()
+                    else:
+                        st.session_state.failed_login_attempts = failed_attempts + 1
+                        if st.session_state.failed_login_attempts >= MAX_LOGIN_ATTEMPTS:
+                            st.session_state.login_lockout_until = datetime.now() + timedelta(
+                                seconds=LOGIN_LOCKOUT_SECONDS)
+                            st.error(
+                                f"Troppi tentativi falliti. Account bloccato per {LOGIN_LOCKOUT_SECONDS} secondi.")
+                        else:
+                            remaining_attempts = MAX_LOGIN_ATTEMPTS - st.session_state.failed_login_attempts
+                            st.error(f"Master Password errata. Tentativi rimasti: {remaining_attempts}.")
+                        st.rerun()
 
     # --- APP PRINCIPALE ---
     else:
@@ -338,6 +117,15 @@ def main():
             st.session_state.authenticated = False
             st.rerun()
             return
+
+        last_activity = st.session_state.get("last_activity")
+        if last_activity and (datetime.now() - last_activity).total_seconds() > SESSION_INACTIVITY_TIMEOUT_SECONDS:
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.warning("Sessione scaduta per inattività. Effettua nuovamente il login.")
+            st.rerun()
+            return
+        st.session_state.last_activity = datetime.now()
 
         manager.derive_and_set_cipher(st.session_state.master_password_cache, kdf_salt)
 
@@ -497,9 +285,9 @@ def main():
                 for service, data in decrypted_passwords.items():
                     pwd = data.get('password')
                     if not pwd or "ERRORE" in pwd: continue
-                    strength = zxcvbn(pwd)
-                    if strength['score'] < 3:
-                        weak_passwords.append((service, strength['score']))
+                    _, _, score, _ = get_password_strength_feedback(pwd)
+                    if score < 3:
+                        weak_passwords.append((service, score))
                 if not weak_passwords:
                     st.success("Perfetto! Tutte le tue password sono robuste.")
                 else:
@@ -539,11 +327,15 @@ def main():
             if uploaded_file:
                 try:
                     imported_data = json.load(uploaded_file)
-                    st.success(f"File '{uploaded_file.name}' caricato con {len(imported_data)} voci.")
-                    if st.button("Sostituisci Database con l'Importazione", type="primary"):
-                        manager.save_encrypted_db(imported_data)
-                        st.success("Database importato!")
-                        st.rerun()
+                    is_valid, validation_error = validate_imported_db(imported_data)
+                    if not is_valid:
+                        st.error(f"File di backup non valido: {validation_error}")
+                    else:
+                        st.success(f"File '{uploaded_file.name}' caricato con {len(imported_data)} voci.")
+                        if st.button("Sostituisci Database con l'Importazione", type="primary"):
+                            manager.save_encrypted_db(imported_data)
+                            st.success("Database importato!")
+                            st.rerun()
                 except Exception as e:
                     st.error(f"Errore durante l'importazione: {e}")
             st.markdown("---")

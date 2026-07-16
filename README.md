@@ -55,6 +55,7 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
     * `cryptography`: Per la crittografia Fernet.
     * `bcrypt`: Per l'hashing della master password.
     * `zxcvbn-python`: Per la valutazione della robustezza delle password.
+    * `pyotp`: Per la generazione dei codici 2FA (TOTP).
     * Librerie standard: `json`, `base64`, `random`, `string`, `os`, `hashlib`.
 
 ---
@@ -76,14 +77,7 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
     ```
 
 3.  **Installa le Dipendenze:**
-    Crea un file `requirements.txt` con il seguente contenuto:
-    ```txt
-    streamlit
-    cryptography
-    bcrypt
-    zxcvbn-python
-    ```
-    Poi installa le dipendenze:
+    Il file `requirements.txt` è già incluso nel repository:
     ```bash
     pip install -r requirements.txt
     ```
@@ -96,3 +90,15 @@ Una volta completato il setup e con l'ambiente virtuale attivato, esegui il segu
 
 ```bash
 streamlit run ps_manager_app.py
+```
+
+---
+
+## 🧪 Test
+
+La logica principale (`PasswordManager` e le funzioni helper) è isolata nel modulo `password_manager.py` ed è coperta da test unitari con `pytest`:
+
+```bash
+pip install pytest
+pytest tests/
+```

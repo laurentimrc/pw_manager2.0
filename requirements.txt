@@ -1,0 +1,5 @@
+streamlit
+cryptography
+bcrypt
+zxcvbn-python
+pyotp
