@@ -106,3 +106,13 @@ La logica principale (`PasswordManager` e le funzioni helper) è isolata nel mod
 pip install pytest
 pytest tests/
 ```
+
+---
+
+## 🌐 Interfaccia alternativa: webapp React + FastAPI
+
+Oltre all'interfaccia Streamlit, il progetto include una **seconda interfaccia**, opzionale e indipendente, nella cartella [`webapp/`](webapp/): un frontend React/TypeScript con look moderno (Tailwind, componenti in stile shadcn/ui) e un backend FastAPI, entrambi pensati per uso locale (il backend ascolta solo su `127.0.0.1`).
+
+Le due interfacce sono equivalenti dal punto di vista funzionale e operano sullo **stesso vault** (`passwords.json`, `master_pwd.hash`, `kdf.salt` nella radice del repository): riusano entrambe `password_manager.py` senza duplicare la logica di dominio. Puoi usare l'una o l'altra indifferentemente (non contemporaneamente sullo stesso file di lock del processo, ma sugli stessi dati).
+
+Per l'avvio e i dettagli architetturali vedi [`webapp/README.md`](webapp/README.md).
