@@ -26,24 +26,28 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
 * **Crittografia dei Dati:**
     * Le password dei singoli servizi sono criptate utilizzando la crittografia simmetrica Fernet (dalla libreria `cryptography`) prima di essere salvate.
 * **Gestione delle Credenziali:**
-    * **Aggiunta:** Inserimento di nuove credenziali (servizio, username, password).
-    * **Visualizzazione:** Elenco di tutte le credenziali salvate con possibilità di mostrare/nascondere le password.
+    * **Aggiunta:** Inserimento di nuove credenziali (servizio, username, password, segreto TOTP opzionale).
+    * **Visualizzazione:** Elenco di tutte le credenziali salvate, con badge visivi (⚠️ Debole, 🔁 Riutilizzata, 🗓️ Anziana) e possibilità di mostrare/nascondere/copiare le password.
     * **Modifica:** Modifica diretta di username e password per credenziali esistenti.
-    * **Eliminazione:** Rimozione sicura di credenziali non più necessarie.
-    * **Ricerca/Filtro:** Campo di ricerca per filtrare rapidamente le credenziali per nome del servizio.
+    * **Eliminazione:** Rimozione delle credenziali con conferma esplicita a due passaggi per evitare cancellazioni accidentali.
+    * **Ricerca/Filtro/Ordinamento:** Campo di ricerca per filtrare le credenziali per nome del servizio, con ordinamento per nome, data di modifica o robustezza.
 * **Generatore di Password Casuali Avanzato:**
     * Generazione di password robuste direttamente dall'interfaccia.
     * Lunghezza della password personalizzabile.
     * Opzioni per includere lettere maiuscole, minuscole, numeri e simboli.
     * Opzione per escludere caratteri ambigui (es. `I, l, 1, O, 0`).
+* **Autenticazione a Due Fattori (TOTP):**
+    * Generazione del codice 2FA corrente per i servizi che hanno un segreto TOTP salvato, con copia rapida e conto alla rovescia visivo.
 * **Indicatore di Robustezza della Password:**
-    * Feedback in tempo reale sulla robustezza della password mentre viene digitata (nel form di aggiunta, modifica e durante il setup della master password) utilizzando la libreria `zxcvbn-python`.
+    * Feedback in tempo reale (testo e barra colorata) sulla robustezza della password mentre viene digitata (nel form di aggiunta, modifica e durante il setup della master password) utilizzando la libreria `zxcvbn-python`.
     * Indicazione della robustezza anche per le password generate.
 * **Import/Export del Database Password:**
     * **Esportazione:** Possibilità di scaricare un backup dell'intero database di password (le password rimangono criptate nel file esportato) in formato JSON.
-    * **Importazione:** Caricamento di un file di backup JSON per ripristinare o unire le password, con opzioni per sovrascrivere o unire i dati.
+    * **Importazione:** Caricamento di un file di backup JSON con validazione della struttura e conferma esplicita prima di sovrascrivere il database esistente.
+* **Sicurezza della Sessione:**
+    * Blocco del login dopo tentativi falliti ripetuti e disconnessione automatica per inattività.
 * **Interfaccia Utente Web:**
-    * Interfaccia utente intuitiva e reattiva costruita con Streamlit.
+    * Interfaccia utente intuitiva e reattiva costruita con Streamlit, con schermate di login/setup centrate, dashboard di sicurezza con metriche riassuntive e pagina Utility organizzata in tab.
 
 ---
 

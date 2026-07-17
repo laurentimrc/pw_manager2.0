@@ -4,8 +4,8 @@ import json
 import os
 import random
 import string
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import bcrypt
 import pyotp
@@ -286,3 +286,59 @@ def validate_imported_db(data: Any) -> Tuple[bool, str]:
                 return False, f"La voce '{service}' ha un campo 'last_updated' con formato data non valido."
 
     return True, ""
+
+
+def compute_security_flags(decrypted_passwords: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Calcola per ogni servizio gli indicatori di sicurezza: 'weak', 'reused', 'old'."""
+    one_year_ago = datetime.now() - timedelta(days=365)
+
+    password_owners: Dict[str, List[str]] = {}
+    for service, data in decrypted_passwords.items():
+        pwd = data.get("password")
+        if pwd and "ERRORE" not in pwd:
+            password_owners.setdefault(pwd, []).append(service)
+    reused_services = {s for owners in password_owners.values() if len(owners) > 1 for s in owners}
+
+    flags: Dict[str, List[str]] = {}
+    for service, data in decrypted_passwords.items():
+        service_flags = []
+
+        pwd = data.get("password")
+        if pwd and "ERRORE" not in pwd and zxcvbn(pwd)["score"] < 3:
+            service_flags.append("weak")
+
+        if service in reused_services:
+            service_flags.append("reused")
+
+        last_updated = data.get("last_updated")
+        if last_updated:
+            try:
+                if datetime.fromisoformat(last_updated) < one_year_ago:
+                    service_flags.append("old")
+            except ValueError:
+                pass
+
+        flags[service] = service_flags
+
+    return flags
+
+
+def sort_credentials(decrypted_passwords: Dict[str, Dict[str, Any]],
+                      sort_by: str = "name") -> List[Tuple[str, Dict[str, Any]]]:
+    """Ordina le credenziali decriptate per nome, data di ultimo aggiornamento o robustezza."""
+    items = list(decrypted_passwords.items())
+
+    if sort_by == "recent":
+        items.sort(key=lambda item: item[1].get("last_updated") or "", reverse=True)
+    elif sort_by == "weakest":
+        def score_of(item: Tuple[str, Dict[str, Any]]) -> int:
+            pwd = item[1].get("password")
+            if not pwd or "ERRORE" in pwd:
+                return 5
+            return zxcvbn(pwd)["score"]
+
+        items.sort(key=score_of)
+    else:
+        items.sort(key=lambda item: item[0].lower())
+
+    return items

@@ -1,11 +1,15 @@
+from datetime import datetime
+
 import pyotp
 import pytest
 
 from password_manager import (
     PasswordManager,
+    compute_security_flags,
     generate_random_password,
     generate_totp_code,
     get_password_strength_feedback,
+    sort_credentials,
     validate_imported_db,
 )
 
@@ -200,3 +204,84 @@ class TestValidateImportedDb:
         }
         is_valid, _ = validate_imported_db(data)
         assert not is_valid
+
+
+class TestSortCredentials:
+    def test_sort_by_name(self):
+        data = {
+            "Zebra": {"password": "x"},
+            "Amazon": {"password": "x"},
+            "mango": {"password": "x"},
+        }
+        result = [service for service, _ in sort_credentials(data, "name")]
+        assert result == ["Amazon", "mango", "Zebra"]
+
+    def test_sort_by_recent(self):
+        data = {
+            "Old": {"last_updated": "2020-01-01T00:00:00"},
+            "New": {"last_updated": "2026-01-01T00:00:00"},
+            "NoDate": {},
+        }
+        result = [service for service, _ in sort_credentials(data, "recent")]
+        assert result.index("New") < result.index("Old") < result.index("NoDate")
+
+    def test_sort_by_weakest(self):
+        data = {
+            "Strong": {"password": "Tr0ub4dor&3-correct-horse-battery"},
+            "Weak": {"password": "123456"},
+            "Errored": {"password": "ERRORE DI DECRIPTAZIONE"},
+        }
+        result = [service for service, _ in sort_credentials(data, "weakest")]
+        assert result.index("Weak") < result.index("Strong") < result.index("Errored")
+
+    def test_default_sort_is_by_name(self):
+        data = {"B": {"password": "x"}, "A": {"password": "x"}}
+        result = [service for service, _ in sort_credentials(data)]
+        assert result == ["A", "B"]
+
+
+class TestComputeSecurityFlags:
+    def test_weak_password_flagged(self):
+        data = {"Weak": {"password": "123456"}}
+        flags = compute_security_flags(data)
+        assert "weak" in flags["Weak"]
+
+    def test_strong_password_not_flagged_weak(self):
+        data = {"Strong": {"password": "Tr0ub4dor&3-correct-horse-battery"}}
+        flags = compute_security_flags(data)
+        assert "weak" not in flags["Strong"]
+
+    def test_reused_password_flagged_for_all_owners(self):
+        data = {
+            "A": {"password": "SamePassword123!"},
+            "B": {"password": "SamePassword123!"},
+            "C": {"password": "DifferentPassword456!"},
+        }
+        flags = compute_security_flags(data)
+        assert "reused" in flags["A"]
+        assert "reused" in flags["B"]
+        assert "reused" not in flags["C"]
+
+    def test_old_password_flagged(self):
+        data = {"Old": {"password": "x", "last_updated": "2020-01-01T00:00:00"}}
+        flags = compute_security_flags(data)
+        assert "old" in flags["Old"]
+
+    def test_recent_password_not_flagged_old(self):
+        data = {"Recent": {"password": "x", "last_updated": datetime.now().isoformat()}}
+        flags = compute_security_flags(data)
+        assert "old" not in flags["Recent"]
+
+    def test_malformed_last_updated_does_not_crash(self):
+        data = {"Broken": {"password": "x", "last_updated": "not-a-date"}}
+        flags = compute_security_flags(data)
+        assert "old" not in flags["Broken"]
+
+    def test_error_password_not_flagged_weak_or_reused(self):
+        data = {
+            "A": {"password": "ERRORE DI DECRIPTAZIONE"},
+            "B": {"password": "ERRORE DI DECRIPTAZIONE"},
+        }
+        flags = compute_security_flags(data)
+        assert flags["A"] == []
+        assert flags["B"] == []
