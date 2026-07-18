@@ -9,6 +9,7 @@ Il server è pensato per ascoltare solo su 127.0.0.1 (vedi comando uvicorn nel
 README): non implementa alcuna protezione per un'esposizione di rete più
 ampia.
 """
+import hmac
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from fastapi.responses import JSONResponse
 
 from password_manager import (  # noqa: E402  (import dopo la manipolazione di sys.path)
     PasswordManager,
+    VaultCorruptedError,
     check_password_breach,
     compute_security_flags,
     generate_random_password,
@@ -59,6 +61,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.settings = settings
     app.state.sessions = SessionStore()
     app.state.login_guard = LoginGuard(settings.max_login_attempts, settings.lockout_seconds)
+    # Guard indipendente per il flusso di recovery: condiviso tra
+    # /api/auth/recover/verify e /api/auth/recover perché entrambi tentano
+    # di indovinare lo stesso segreto (il codice di recovery), quindi un
+    # attaccante non deve poter aggirare il lockout distribuendo i tentativi
+    # tra i due endpoint.
+    app.state.recovery_guard = LoginGuard(settings.max_login_attempts, settings.lockout_seconds)
 
     app.add_middleware(
         CORSMiddleware,
@@ -70,6 +78,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     sessions: SessionStore = app.state.sessions
     login_guard: LoginGuard = app.state.login_guard
+    recovery_guard: LoginGuard = app.state.recovery_guard
 
     # --- Helpers interni ---
     def get_manager() -> PasswordManager:
@@ -151,7 +160,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         # Al primo sblocco di un vault appena creato, `derive_and_set_cipher`
         # minta la DEK e restituisce il primo codice di recovery: va mostrato
         # una sola volta all'utente subito dopo il setup (vedi frontend).
-        recovery_code = manager.derive_and_set_cipher(payload.new_password, salt)
+        try:
+            recovery_code = manager.derive_and_set_cipher(payload.new_password, salt)
+        except VaultCorruptedError:
+            raise HTTPException(
+                status_code=500,
+                detail="Il materiale crittografico del vault risulta corrotto. Rimuovi vault_key.json "
+                       "e riprova, oppure ripristina un backup.",
+            )
 
         session_id = sessions.create(payload.new_password, manager.cipher_suite)
         login_guard.reset()
@@ -198,7 +214,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         # della DEK) che viene migrato automaticamente proprio in questo
         # login: in quel caso, come al setup, il nuovo codice di recovery va
         # mostrato una volta sola all'utente.
-        recovery_code = manager.derive_and_set_cipher(payload.password, salt)
+        try:
+            recovery_code = manager.derive_and_set_cipher(payload.password, salt)
+        except VaultCorruptedError:
+            raise HTTPException(
+                status_code=500,
+                detail="Il materiale crittografico del vault risulta corrotto. Contatta l'amministratore "
+                       "o ripristina un backup.",
+            )
 
         session_id = sessions.create(payload.password, manager.cipher_suite)
         set_session_cookie(response, session_id)
@@ -224,11 +247,32 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         manager = get_manager()
         if not manager.master_hash_exists():
             raise HTTPException(status_code=409, detail="Nessun vault esistente da recuperare.")
+
+        remaining_lockout = recovery_guard.locked_remaining_seconds()
+        if remaining_lockout > 0:
+            raise HTTPException(
+                status_code=423,
+                detail={"code": "locked_out",
+                        "message": f"Troppi tentativi falliti. Riprova tra {remaining_lockout} secondi.",
+                        "remaining_seconds": remaining_lockout},
+            )
+
         if not manager.verify_recovery_code(payload.recovery_code):
+            remaining_attempts = recovery_guard.register_failure()
+            if remaining_attempts <= 0:
+                raise HTTPException(
+                    status_code=423,
+                    detail={"code": "locked_out",
+                            "message": f"Troppi tentativi falliti. Riprova tra "
+                                       f"{settings.lockout_seconds} secondi.",
+                            "remaining_seconds": settings.lockout_seconds},
+                )
             raise HTTPException(
                 status_code=400,
                 detail={"code": "invalid_recovery_code", "message": "Codice di recovery non valido."},
             )
+
+        recovery_guard.reset()
         return {"valid": True}
 
     @app.post("/api/auth/recover")
@@ -236,6 +280,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         manager = get_manager()
         if not manager.master_hash_exists():
             raise HTTPException(status_code=409, detail="Nessun vault esistente da recuperare.")
+
+        remaining_lockout = recovery_guard.locked_remaining_seconds()
+        if remaining_lockout > 0:
+            raise HTTPException(
+                status_code=423,
+                detail={"code": "locked_out",
+                        "message": f"Troppi tentativi falliti. Riprova tra {remaining_lockout} secondi.",
+                        "remaining_seconds": remaining_lockout},
+            )
+
         if not payload.recovery_code or not payload.new_password or not payload.confirm_password:
             raise HTTPException(status_code=400, detail="Tutti i campi sono obbligatori.")
         if payload.new_password != payload.confirm_password:
@@ -249,11 +303,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         dek = manager.recover_with_code(payload.recovery_code)
         if dek is None:
+            remaining_attempts = recovery_guard.register_failure()
+            if remaining_attempts <= 0:
+                raise HTTPException(
+                    status_code=423,
+                    detail={"code": "locked_out",
+                            "message": f"Troppi tentativi falliti. Riprova tra "
+                                       f"{settings.lockout_seconds} secondi.",
+                            "remaining_seconds": settings.lockout_seconds},
+                )
             raise HTTPException(
                 status_code=400,
                 detail={"code": "invalid_recovery_code", "message": "Codice di recovery non valido."},
             )
 
+        recovery_guard.reset()
         new_recovery_code = manager.complete_recovery(dek, payload.new_password)
         return {"recovery_code": new_recovery_code}
 
@@ -491,7 +555,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Tutti i campi sono obbligatori.")
         if payload.new_password != payload.confirm_password:
             raise HTTPException(status_code=400, detail="Le nuove password non coincidono.")
-        if payload.old_password != session.master_password:
+        if not hmac.compare_digest(payload.old_password, session.master_password):
             raise HTTPException(
                 status_code=400,
                 detail="La 'Vecchia Master Password' inserita non corrisponde a quella della sessione corrente.",
@@ -519,7 +583,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         esplicita, stesso principio di change-master-password."""
         if not payload.current_password:
             raise HTTPException(status_code=400, detail="La Master Password corrente è obbligatoria.")
-        if payload.current_password != session.master_password:
+        if not hmac.compare_digest(payload.current_password, session.master_password):
             raise HTTPException(
                 status_code=400,
                 detail="La Master Password inserita non corrisponde a quella della sessione corrente.",

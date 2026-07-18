@@ -12,6 +12,7 @@ from cryptography.fernet import Fernet
 from password_manager import (
     PBKDF2_ITERATIONS,
     PasswordManager,
+    VaultCorruptedError,
     check_password_breach,
     compute_security_flags,
     generate_random_password,
@@ -71,6 +72,50 @@ class TestMasterPassword:
     def test_verify_empty_password_fails(self, manager):
         manager.set_master_hash("MySecretPassword123!")
         assert not manager.verify_master_password("")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="I permessi POSIX 0600 non si applicano su piattaforme non-POSIX.")
+class TestFilePermissions:
+    """I file del vault contengono l'hash della master password e il
+    materiale crittografico che protegge le credenziali: non devono mai
+    essere leggibili da altri utenti del sistema (permessi 0600), altrimenti
+    un attaccante locale può fare brute-force offline bypassando il lockout
+    di login, che protegge solo l'app in esecuzione, non l'accesso diretto
+    ai file."""
+
+    @staticmethod
+    def _mode(path: str) -> int:
+        return os.stat(path).st_mode & 0o777
+
+    def test_master_hash_file_is_owner_only(self, manager):
+        manager.set_master_hash("MySecretPassword123!")
+        assert self._mode(manager.hash_file) == 0o600
+
+    def test_kdf_salt_file_is_owner_only(self, manager):
+        manager.generate_and_save_kdf_salt()
+        assert self._mode(manager.salt_file) == 0o600
+
+    def test_vault_key_file_is_owner_only(self, manager):
+        unlock_with_recovery(manager)
+        assert self._mode(manager.key_file) == 0o600
+
+    def test_db_file_is_owner_only(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+        assert self._mode(manager.db_file) == 0o600
+
+    def test_permissions_restricted_even_if_file_pre_existed_world_readable(self, manager):
+        # Un file preesistente con permessi larghi (es. creato da una
+        # versione precedente dell'app, prima di questo fix) deve essere
+        # ristretto al primo salvataggio successivo, non solo alla prima
+        # creazione.
+        with open(manager.hash_file, "wb") as f:
+            f.write(b"placeholder")
+        os.chmod(manager.hash_file, 0o644)
+        assert self._mode(manager.hash_file) == 0o644
+
+        manager.set_master_hash("MySecretPassword123!")
+        assert self._mode(manager.hash_file) == 0o600
 
 
 class TestCredentials:
@@ -268,6 +313,53 @@ class TestVaultKeyAndRecovery:
 
         assert not recovering_manager.verify_recovery_code(recovery_code)
         assert recovering_manager.recover_with_code(recovery_code) is None
+
+
+class TestVaultCorruption:
+    """Un vault_key.json corrotto/manomesso non deve mai far propagare
+    un'eccezione grezza (KeyError, cryptography.fernet.InvalidToken, ...) al
+    chiamante: entrambe le interfacce si aspettano VaultCorruptedError per
+    poter mostrare un errore pulito senza far trapelare dettagli interni
+    (path assoluti, stack trace) all'utente."""
+
+    def test_tampered_wrapped_dek_raises_vault_corrupted_error(self, manager):
+        password, _ = unlock_with_recovery(manager)
+        salt = manager.load_kdf_salt()
+
+        key_material = manager._load_key_material()
+        key_material["dek_wrapped_by_master"] = "not-a-valid-fernet-token"
+        manager._save_key_material(key_material)
+
+        fresh_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        with pytest.raises(VaultCorruptedError):
+            fresh_manager.derive_and_set_cipher(password, salt)
+
+    def test_missing_field_in_key_material_raises_vault_corrupted_error(self, manager):
+        password, _ = unlock_with_recovery(manager)
+        salt = manager.load_kdf_salt()
+
+        key_material = manager._load_key_material()
+        del key_material["dek_wrapped_by_master"]
+        manager._save_key_material(key_material)
+
+        fresh_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        with pytest.raises(VaultCorruptedError):
+            fresh_manager.derive_and_set_cipher(password, salt)
+
+    def test_change_master_password_handles_corruption_gracefully(self, manager):
+        # change_master_password già racchiude derive_and_set_cipher in un
+        # except Exception generico: un VaultCorruptedError deve continuare
+        # a tradursi in un fallimento pulito (successo=False), non in un
+        # crash, dato che VaultCorruptedError è comunque una Exception.
+        password, _ = unlock_with_recovery(manager)
+
+        key_material = manager._load_key_material()
+        key_material["dek_wrapped_by_master"] = "not-a-valid-fernet-token"
+        manager._save_key_material(key_material)
+
+        success, message = manager.change_master_password(password, "Another-New-Master-Pass-2!")
+        assert not success
+        assert message
 
 
 class TestRegenerateRecoveryCode:

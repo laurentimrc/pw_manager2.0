@@ -25,6 +25,21 @@ AMBIGUOUS_CHARACTERS = "Il1O0|'`"
 HIBP_RANGE_URL = "https://api.pwnedpasswords.com/range/{prefix}"
 HIBP_USER_AGENT = "PasswordManagerPro-BreachCheck (k-anonymity client, no data retained)"
 
+
+def _open_for_restricted_write(path: str, mode: str):
+    """Apre `path` in scrittura creando il file (o troncando quello
+    esistente) con permessi 0600, in modo che l'hash della master password e
+    il materiale crittografico del vault non siano mai leggibili da altri
+    utenti del sistema. Il parametro `mode` di `os.open` viene applicato dal
+    sistema operativo solo quando il file viene creato ex novo: se esisteva
+    già (es. un vault creato da una versione precedente dell'app, con
+    permessi più larghi) i suoi permessi non cambierebbero da soli, quindi
+    li forziamo esplicitamente con `fchmod` in ogni caso."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    return os.fdopen(fd, mode)
+
 # Alfabeto ristretto (maiuscole + cifre, senza caratteri ambigui) usato per i
 # codici di recovery: pensati per essere trascritti a mano, non digitati a
 # macchina come una password normale.
@@ -34,6 +49,14 @@ RECOVERY_CODE_ALPHABET = "".join(
 RECOVERY_CODE_BLOCK_COUNT = 5
 RECOVERY_CODE_BLOCK_LENGTH = 4
 KEY_MATERIAL_VERSION = 2
+
+
+class VaultCorruptedError(Exception):
+    """Il materiale crittografico del vault (`vault_key.json`) esiste ma non
+    è utilizzabile per svelare la DEK con la master password corrente (JSON
+    malformato, campo mancante, token Fernet non valido/manomesso). Non
+    indica una password errata: `verify_master_password` (bcrypt) ha già
+    superato il controllo prima che questo errore possa verificarsi."""
 
 
 class PasswordManager:
@@ -86,7 +109,7 @@ class PasswordManager:
     def set_master_hash(self, password: str) -> None:
         salt = bcrypt.gensalt()
         hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt)
-        with open(self.hash_file, "wb") as f:
+        with _open_for_restricted_write(self.hash_file, "wb") as f:
             f.write(hashed_password)
 
     def verify_master_password(self, password: str) -> bool:
@@ -106,7 +129,7 @@ class PasswordManager:
 
     def generate_and_save_kdf_salt(self) -> bytes:
         salt = os.urandom(16)
-        with open(self.salt_file, "wb") as f:
+        with _open_for_restricted_write(self.salt_file, "wb") as f:
             f.write(salt)
         return salt
 
@@ -128,7 +151,7 @@ class PasswordManager:
             return None
 
     def _save_key_material(self, key_material: Dict[str, Any]) -> None:
-        with open(self.key_file, "w") as f:
+        with _open_for_restricted_write(self.key_file, "w") as f:
             json.dump(key_material, f, indent=4)
 
     def _build_key_material(self, dek: bytes, master_kek: bytes) -> Tuple[Dict[str, Any], str]:
@@ -174,7 +197,21 @@ class PasswordManager:
         key_material = self._load_key_material()
 
         if key_material is not None:
-            dek = Fernet(master_kek).decrypt(key_material["dek_wrapped_by_master"].encode())
+            try:
+                dek = Fernet(master_kek).decrypt(key_material["dek_wrapped_by_master"].encode())
+            except Exception as exc:
+                # `verify_master_password` (bcrypt) ha già superato il
+                # controllo prima di arrivare qui: questo non è quindi un
+                # caso di password errata, ma di vault_key.json corrotto,
+                # illeggibile o modificato (JSON malformato, campo mancante,
+                # token Fernet non valido). Segnalarlo con un tipo dedicato
+                # invece di lasciar propagare l'eccezione originale evita che
+                # un'interfaccia con la visualizzazione errori attiva (es.
+                # Streamlit in sviluppo) mostri uno stack trace con path
+                # assoluti del server nel browser dell'utente.
+                raise VaultCorruptedError(
+                    "Il materiale crittografico del vault (vault_key.json) è corrotto o illeggibile."
+                ) from exc
             self.cipher_suite = Fernet(dek)
             return None
 
@@ -294,7 +331,7 @@ class PasswordManager:
             return {}
 
     def save_encrypted_db(self, data: Dict[str, Any]) -> None:
-        with open(self.db_file, "w") as f:
+        with _open_for_restricted_write(self.db_file, "w") as f:
             json.dump(data, f, indent=4)
 
     def get_decrypted_passwords(self) -> Optional[Dict[str, Dict[str, str]]]:
