@@ -85,6 +85,36 @@ npm run dev
 
 Apri **`http://127.0.0.1:5173`** (non `localhost`: i cookie di sessione sono legati all'host `127.0.0.1` usato dal backend, e `localhost`/`127.0.0.1` sono host diversi ai fini dei cookie).
 
+## Accesso da altri dispositivi (es. telefono) via Tailscale
+
+Backend e frontend restano su `127.0.0.1` per scelta di sicurezza di default. Per usare l'app anche dal telefono senza esporla su internet, il modo più semplice è tramite [Tailscale](https://tailscale.com/) (rete privata WireGuard tra i tuoi dispositivi, nessuna configurazione di router/port forwarding):
+
+1. Installa Tailscale sul computer che fa girare l'app e sul telefono, con lo stesso account su entrambi.
+2. Trova l'IP Tailscale del computer: `tailscale ip -4` (es. `100.x.y.z`).
+3. Avvia il backend legandolo all'IP Tailscale e aggiungendo l'origine del frontend alla whitelist CORS:
+   ```bash
+   cd webapp/backend
+   PWM_CORS_ORIGINS="http://100.x.y.z:5173" \
+     python -m uvicorn app.main:app --app-dir . --host 100.x.y.z --port 8000
+   ```
+   (`--host 0.0.0.0` funziona altrettanto bene, ma resta raggiungibile anche su qualunque altra rete a cui è connesso il computer, non solo dal tailnet — se il computer si collega a reti non fidate, preferisci il bind esplicito all'IP Tailscale come sopra.)
+4. Crea `webapp/frontend/.env.local` (già escluso da git, non sovrascrive `.env` nel repo) con:
+   ```
+   VITE_API_BASE_URL=http://100.x.y.z:8000
+   ```
+   Necessario perché il frontend, una volta caricato sul telefono, deve chiamare il backend all'IP giusto: `127.0.0.1` dal telefono punterebbe al telefono stesso, non al computer.
+5. Avvia il frontend in ascolto sull'IP Tailscale:
+   ```bash
+   cd webapp/frontend
+   npm run dev -- --host 100.x.y.z
+   ```
+   (il flag `--host` passato al comando sovrascrive il valore di default `127.0.0.1` in `vite.config.ts`.)
+6. Dal telefono, con Tailscale attivo, apri `http://100.x.y.z:5173`.
+
+Verificato che questo flusso funziona interamente (setup, login, sessione persistente) quando backend e frontend condividono un host diverso da `127.0.0.1`: i cookie httpOnly/SameSite=Strict restano validi perché backend e frontend condividono lo stesso host (qui l'IP Tailscale), esattamente come oggi con `127.0.0.1` — cambia solo quale host, non il meccanismo. Il traffico tra i tuoi dispositivi è comunque cifrato dal livello WireGuard di Tailscale anche se l'app parla HTTP semplice (`cookie_secure=False`, invariato): non serve TLS applicativo per restare ragionevolmente al sicuro dentro il tailnet.
+
+Vale in modo analogo anche per l'app Streamlit: `streamlit run ps_manager_app.py --server.address 100.x.y.z`.
+
 ## Test
 
 ```bash
