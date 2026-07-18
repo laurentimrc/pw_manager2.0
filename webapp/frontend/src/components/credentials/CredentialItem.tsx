@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, Eye, EyeOff, KeyRound, Pencil, Trash2 } from 'lucide-react'
+import { ChevronRight, Eye, EyeOff, KeyRound, Pencil, Trash2 } from 'lucide-react'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
@@ -75,7 +75,7 @@ export function CredentialItem({
       <button
         type="button"
         onClick={() => setExpanded((prev) => !prev)}
-        className="flex w-full items-center justify-between gap-3 p-4 text-left"
+        className="flex w-full items-center justify-between gap-3 rounded-2xl p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         data-testid={`credential-toggle-${item.service}`}
       >
         <span className="flex items-center gap-2 font-medium">
@@ -88,12 +88,14 @@ export function CredentialItem({
               {FLAG_LABELS[flag]}
             </Badge>
           ))}
-          {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          <ChevronRight
+            className={`h-4 w-4 transition-transform duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)] ${expanded ? 'rotate-90' : ''}`}
+          />
         </span>
       </button>
 
       {expanded && (
-        <div className="border-t border-border p-4">
+        <div className="animate-spring-in border-t border-border p-4">
           {isEditing ? (
             <EditCredentialForm service={item.service} onSaved={onSaved} onCancel={onCancelEdit} />
           ) : (
@@ -101,7 +103,7 @@ export function CredentialItem({
               <div>
                 <p className="text-xs font-medium text-muted-foreground">Username/Email</p>
                 <div className="mt-1 flex items-center gap-2">
-                  <code className="flex-1 rounded-md bg-muted px-2 py-1 text-sm">{item.username}</code>
+                  <code className="flex-1 rounded-xl bg-muted px-3 py-1.5 text-sm">{item.username}</code>
                   <CopyButton label="Copia username" getValue={() => item.username} />
                 </div>
               </div>
@@ -109,7 +111,7 @@ export function CredentialItem({
               <div>
                 <p className="text-xs font-medium text-muted-foreground">Password</p>
                 <div className="mt-1 flex items-center gap-2">
-                  <code className="flex-1 rounded-md bg-muted px-2 py-1 text-sm" data-testid={`password-value-${item.service}`}>
+                  <code className="flex-1 rounded-xl bg-muted px-3 py-1.5 text-sm" data-testid={`password-value-${item.service}`}>
                     {showPassword ? secret?.password ?? '••••••••••' : '••••••••••'}
                   </code>
                   <Button type="button" variant="outline" size="sm" onClick={handleToggleShow}>

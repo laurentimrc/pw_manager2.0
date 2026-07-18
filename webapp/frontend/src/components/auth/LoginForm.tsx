@@ -53,7 +53,7 @@ export function LoginForm({
   }
 
   return (
-    <Card>
+    <Card variant="glass" className="animate-spring-in">
       <CardHeader>
         <CardTitle>Login</CardTitle>
       </CardHeader>

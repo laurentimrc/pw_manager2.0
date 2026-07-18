@@ -28,25 +28,198 @@ SESSION_INACTIVITY_TIMEOUT_SECONDS = 15 * 60
 
 CUSTOM_CSS = """
 <style>
+/* ------------------------------------------------------------------------
+   "Liquid Glass" cosmetic layer for the Streamlit interface.
+   CSS-only, injected via st.markdown: Streamlit's own widget markup and
+   behavior are untouched. Scope is intentionally limited to what a plain
+   CSS override can safely reach (colors, radii, shadows, a couple of
+   translucent/blurred "chrome" surfaces) - see the design review notes for
+   what this platform does not allow (no control over widget internals, no
+   true modal dialogs, no reliable mount/expand animations because Streamlit
+   re-executes the whole script on every interaction).
+
+   Streamlit's default (unconfigured) theme already follows the OS light/dark
+   preference, so every color below is duplicated under
+   prefers-color-scheme: dark to stay consistent with that behavior instead
+   of fighting it via .streamlit/config.toml (which would pin the theme and
+   break the automatic switch - not something this pass touches).
+   ------------------------------------------------------------------------ */
+
+:root {
+    --pwm-glass-blur: 22px;
+}
+
+/* Ambient background wash so the translucent surfaces below have something
+   to refract - otherwise a backdrop-blur over a flat white/near-black page
+   is invisible. */
+div[data-testid="stApp"] {
+    background-image:
+        radial-gradient(circle at 12% 6%, rgba(91, 79, 233, 0.10), transparent 45%),
+        radial-gradient(circle at 90% 94%, rgba(91, 79, 233, 0.07), transparent 50%);
+    background-attachment: fixed;
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stApp"] {
+        background-image:
+            radial-gradient(circle at 12% 6%, rgba(129, 121, 255, 0.18), transparent 45%),
+            radial-gradient(circle at 90% 94%, rgba(129, 121, 255, 0.11), transparent 50%);
+    }
+}
+
+/* Sidebar: the one persistent "chrome" surface in this app - a legitimate
+   glass-material target (unlike list rows, it's a single instance). */
+div[data-testid="stSidebar"] {
+    background: rgba(255, 255, 255, 0.6) !important;
+    -webkit-backdrop-filter: blur(var(--pwm-glass-blur)) saturate(160%);
+    backdrop-filter: blur(var(--pwm-glass-blur)) saturate(160%);
+    border-right: 1px solid rgba(255, 255, 255, 0.5);
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stSidebar"] {
+        background: rgba(20, 22, 30, 0.55) !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+}
+
+/* Forms are this app's "cards" (login, setup, add/edit credential, change
+   master password, import/export) - always a single instance on screen at
+   a time, never a repeated list row, so a real glass material is safe. */
+div[data-testid="stForm"] {
+    border-radius: 20px !important;
+    border: 1px solid rgba(255, 255, 255, 0.5) !important;
+    background: rgba(255, 255, 255, 0.66) !important;
+    -webkit-backdrop-filter: blur(var(--pwm-glass-blur)) saturate(150%);
+    backdrop-filter: blur(var(--pwm-glass-blur)) saturate(150%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 12px 32px -16px rgba(30, 20, 60, 0.18);
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stForm"] {
+        border: 1px solid rgba(255, 255, 255, 0.08) !important;
+        background: rgba(30, 32, 42, 0.62) !important;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 12px 32px -16px rgba(0, 0, 0, 0.5);
+    }
+}
+
+/* The outer st.container(border=True) wrapping the login/setup form would
+   otherwise draw a second, redundant box around the glass card above - make
+   it invisible chrome instead. */
+div[data-testid="stVerticalBlock"]:has(> div[data-testid="stLayoutWrapper"] > div[data-testid="stForm"]) {
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+}
+
+/* Credential rows AND the dashboard risk categories both use st.expander,
+   and a credential list can get long - so this stays a plain OPAQUE
+   elevated surface on purpose, no backdrop-filter, to avoid a per-row blur
+   cost while scrolling. */
 div[data-testid="stExpander"] {
-    border-radius: 12px;
+    border-radius: 18px;
     border: 1px solid rgba(128, 128, 128, 0.18);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 8px 20px -14px rgba(0, 0, 0, 0.18);
+    overflow: hidden;
 }
+
+/* Dashboard KPI tiles: a small, fixed-size group of 4 - a light glass
+   treatment is fine here since it never repeats into a long list. */
 div[data-testid="stMetric"] {
-    background: var(--secondary-background-color);
-    border-radius: 10px;
-    padding: 0.6rem 1rem;
-    border: 1px solid rgba(128, 128, 128, 0.15);
+    background: rgba(255, 255, 255, 0.55) !important;
+    -webkit-backdrop-filter: blur(14px) saturate(150%);
+    backdrop-filter: blur(14px) saturate(150%);
+    border-radius: 16px;
+    padding: 0.7rem 1.1rem;
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
 }
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stMetric"] {
+        background: rgba(30, 32, 42, 0.55) !important;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+}
+
+/* Pill-shaped buttons with a light press feedback. No entrance/spring
+   animation here on purpose: Streamlit re-runs the whole script on every
+   interaction, so a "mount" animation on a freshly re-rendered DOM node
+   would just flash rather than feel intentional. */
+button[data-testid="stBaseButton-primary"],
+button[data-testid="stBaseButton-secondary"],
+button[data-testid="stBaseButton-primaryFormSubmit"],
+button[data-testid="stBaseButton-header"] {
+    border-radius: 999px !important;
+    transition: transform 120ms ease, box-shadow 120ms ease;
+}
+button[data-testid="stBaseButton-primary"]:active,
+button[data-testid="stBaseButton-secondary"]:active,
+button[data-testid="stBaseButton-primaryFormSubmit"]:active {
+    transform: scale(0.97);
+}
+
+/* Text inputs: generous rounding to match the pill/rounded-rect language
+   used everywhere else. */
+div[data-testid="stTextInputRootElement"] {
+    border-radius: 14px !important;
+}
+
+/* Sidebar nav ("Menu" radio): pill highlight for the selected item. */
+label[data-testid="stRadioOption"] {
+    border-radius: 12px;
+    padding: 0.2rem 0.5rem;
+    transition: background-color 120ms ease;
+}
+label[data-testid="stRadioOption"][data-selected="true"] {
+    background: rgba(91, 79, 233, 0.12);
+}
+@media (prefers-color-scheme: dark) {
+    label[data-testid="stRadioOption"][data-selected="true"] {
+        background: rgba(129, 121, 255, 0.18);
+    }
+}
+
+/* Alerts: soften corners only - colors stay Streamlit's own
+   success/warning/error/info so the semantics don't change. */
+div[data-testid="stAlertContainer"] {
+    border-radius: 14px;
+}
+
 .pwm-badge {
     display: inline-block;
-    padding: 0.15rem 0.6rem;
+    padding: 0.2rem 0.75rem;
     border-radius: 999px;
     background: rgba(255, 174, 0, 0.15);
     color: #b9770e;
     font-size: 0.78rem;
     font-weight: 600;
+}
+
+/* Respect explicit user preferences: fall back to fully opaque surfaces
+   when the browser reports reduced transparency / increased contrast,
+   exactly like the React app does. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+    div[data-testid="stSidebar"],
+    div[data-testid="stForm"],
+    div[data-testid="stMetric"] {
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
+        background: #ffffff !important;
+    }
+}
+@media (prefers-color-scheme: dark) and (prefers-reduced-transparency: reduce),
+    (prefers-color-scheme: dark) and (prefers-contrast: more) {
+    div[data-testid="stSidebar"],
+    div[data-testid="stForm"],
+    div[data-testid="stMetric"] {
+        background: #171922 !important;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    button[data-testid="stBaseButton-primary"],
+    button[data-testid="stBaseButton-secondary"],
+    button[data-testid="stBaseButton-primaryFormSubmit"],
+    label[data-testid="stRadioOption"] {
+        transition: none !important;
+    }
 }
 </style>
 """

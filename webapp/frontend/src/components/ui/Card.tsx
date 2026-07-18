@@ -1,10 +1,26 @@
 import type { HTMLAttributes } from 'react'
 import { cn } from '@/lib/cn'
 
-export function Card({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
+export interface CardProps extends HTMLAttributes<HTMLDivElement> {
+  /**
+   * 'surface' (default): opaque elevated card - used for repeated/list content
+   * where a backdrop blur would hurt scroll performance and legibility.
+   * 'glass': true translucent Liquid Glass material - reserve for standalone,
+   * non-repeated surfaces (e.g. the login/setup card floating on the app wash).
+   */
+  variant?: 'surface' | 'glass'
+}
+
+export function Card({ className, variant = 'surface', ...props }: CardProps) {
   return (
     <div
-      className={cn('rounded-xl border border-border bg-card text-card-foreground shadow-sm', className)}
+      className={cn(
+        'rounded-2xl text-card-foreground',
+        variant === 'glass'
+          ? 'glass-surface-strong'
+          : 'border border-border bg-card shadow-[0_1px_2px_rgba(0,0,0,0.06),0_8px_24px_-16px_rgba(0,0,0,0.25)]',
+        className,
+      )}
       {...props}
     />
   )

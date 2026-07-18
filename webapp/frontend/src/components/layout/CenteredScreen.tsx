@@ -4,8 +4,8 @@ import { ThemeToggle } from '@/components/layout/ThemeToggle'
 
 export function CenteredScreen({ children }: { children: ReactNode }) {
   return (
-    <div className="flex min-h-screen flex-col bg-background">
-      <header className="flex items-center justify-between border-b border-border px-6 py-4">
+    <div className="app-shell flex min-h-screen flex-col">
+      <header className="glass-surface sticky top-0 z-10 flex items-center justify-between rounded-none border-x-0 border-t-0 px-6 py-4">
         <div className="flex items-center gap-2">
           <KeyRound className="h-6 w-6 text-primary" />
           <span className="text-lg font-semibold">Password Manager Pro</span>

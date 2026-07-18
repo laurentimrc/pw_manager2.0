@@ -20,7 +20,7 @@ export function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
   }
 
   return (
-    <div className="flex min-h-screen bg-background">
+    <div className="app-shell flex min-h-screen">
       <Sidebar view={view} onChangeView={setView} credentialCount={credentialCount} onLock={handleLock} />
       <main className="flex-1 overflow-y-auto p-6">
         <div className="mx-auto max-w-3xl">

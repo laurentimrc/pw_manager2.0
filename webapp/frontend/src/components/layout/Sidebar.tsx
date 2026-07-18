@@ -24,13 +24,13 @@ export function Sidebar({
   onLock: () => void
 }) {
   return (
-    <aside className="flex w-64 shrink-0 flex-col gap-6 border-r border-border bg-card p-4">
+    <aside className="glass-surface sticky top-0 flex h-screen w-64 shrink-0 flex-col gap-6 rounded-none border-y-0 border-l-0 p-4">
       <div>
         <div className="flex items-center gap-2 px-1">
           <KeyRound className="h-5 w-5 text-primary" />
           <span className="font-semibold">Password Manager Pro</span>
         </div>
-        <div className="mt-3 flex items-center justify-between rounded-md bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
+        <div className="mt-3 flex items-center justify-between rounded-xl bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
           <span>Accesso eseguito</span>
         </div>
         <p className="mt-2 px-1 text-xs text-muted-foreground">{credentialCount} credenziali salvate</p>
@@ -44,9 +44,11 @@ export function Sidebar({
             onClick={() => onChangeView(itemView)}
             data-testid={`nav-${itemView}`}
             className={cn(
-              'flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm font-medium transition-colors',
+              'flex items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-medium',
+              'transition-[background-color,color,transform] duration-150 ease-[cubic-bezier(0.34,1.56,0.64,1)] active:scale-[0.98]',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
               view === itemView
-                ? 'bg-primary text-primary-foreground'
+                ? 'bg-primary text-primary-foreground shadow-sm'
                 : 'text-foreground hover:bg-accent hover:text-accent-foreground',
             )}
           >

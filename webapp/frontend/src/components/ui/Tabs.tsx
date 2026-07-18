@@ -29,7 +29,7 @@ export function TabsList({ children, className }: { children: ReactNode; classNa
   return (
     <div
       className={cn(
-        'inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground',
+        'inline-flex h-10 items-center justify-center gap-0.5 rounded-full bg-muted p-1 text-muted-foreground',
         className,
       )}
     >
@@ -47,8 +47,9 @@ export function TabsTrigger({ value, children }: { value: string; children: Reac
       type="button"
       onClick={() => ctx.setValue(value)}
       className={cn(
-        'inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium',
-        'transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        'inline-flex items-center justify-center whitespace-nowrap rounded-full px-3.5 py-1.5 text-sm font-medium',
+        'transition-[background-color,color,box-shadow,transform] duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)]',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         isActive ? 'bg-card text-foreground shadow-sm' : 'hover:text-foreground',
       )}
     >
@@ -61,5 +62,9 @@ export function TabsContent({ value, children }: { value: string; children: Reac
   const ctx = useContext(TabsContext)
   if (!ctx) throw new Error('TabsContent deve essere usato dentro <Tabs>')
   if (ctx.value !== value) return null
-  return <div className="mt-4">{children}</div>
+  return (
+    <div className="mt-4 animate-spring-in" key={value}>
+      {children}
+    </div>
+  )
 }

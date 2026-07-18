@@ -51,7 +51,7 @@ export function TotpDisplay({ service }: { service: string }) {
     <div className="flex flex-col gap-1.5" data-testid="totp-display">
       <span className="text-xs font-medium text-muted-foreground">Codice 2FA</span>
       <div className="flex items-center gap-2">
-        <code className="rounded-md bg-muted px-2 py-1 text-base font-mono tracking-widest">{code ?? '------'}</code>
+        <code className="rounded-xl bg-muted px-3 py-1.5 text-base font-mono tracking-widest">{code ?? '------'}</code>
         <CopyButton label="Copia codice 2FA" getValue={() => code ?? ''} />
         <Button type="button" variant="ghost" size="icon" onClick={fetchCode} title="Aggiorna codice" aria-label="Aggiorna codice">
           <RefreshCw className="h-3.5 w-3.5" />
