@@ -42,7 +42,7 @@ export function SetupForm({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <Card variant="glass" className="animate-spring-in">
+    <Card variant="glass" className="animate-spring-in-lg">
       <CardHeader>
         <CardTitle>Imposta la tua Master Password</CardTitle>
         <CardDescription>

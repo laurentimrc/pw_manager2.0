@@ -78,8 +78,10 @@ export function CredentialItem({
         className="flex w-full items-center justify-between gap-3 rounded-2xl p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         data-testid={`credential-toggle-${item.service}`}
       >
-        <span className="flex items-center gap-2 font-medium">
-          <KeyRound className="h-4 w-4 text-primary" />
+        <span className="flex items-center gap-2.5 font-medium">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            <KeyRound className="h-4 w-4" />
+          </span>
           {item.service}
         </span>
         <span className="flex items-center gap-2">
@@ -103,7 +105,7 @@ export function CredentialItem({
               <div>
                 <p className="text-xs font-medium text-muted-foreground">Username/Email</p>
                 <div className="mt-1 flex items-center gap-2">
-                  <code className="flex-1 rounded-xl bg-muted px-3 py-1.5 text-sm">{item.username}</code>
+                  <code className="glass-1 flex-1 rounded-2xl px-3.5 py-2 text-sm">{item.username}</code>
                   <CopyButton label="Copia username" getValue={() => item.username} />
                 </div>
               </div>
@@ -111,7 +113,10 @@ export function CredentialItem({
               <div>
                 <p className="text-xs font-medium text-muted-foreground">Password</p>
                 <div className="mt-1 flex items-center gap-2">
-                  <code className="flex-1 rounded-xl bg-muted px-3 py-1.5 text-sm" data-testid={`password-value-${item.service}`}>
+                  <code
+                    className="glass-1 flex-1 rounded-2xl px-3.5 py-2 text-sm tracking-wide"
+                    data-testid={`password-value-${item.service}`}
+                  >
                     {showPassword ? secret?.password ?? '••••••••••' : '••••••••••'}
                   </code>
                   <Button type="button" variant="outline" size="sm" onClick={handleToggleShow}>

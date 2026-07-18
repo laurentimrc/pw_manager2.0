@@ -1,15 +1,37 @@
 import { useEffect, useState } from 'react'
-import { AlertTriangle, RefreshCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { Clock3, KeyRound, RefreshCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card'
 import { Alert } from '@/components/ui/Alert'
 import { api, ApiError } from '@/lib/api'
+import { cn } from '@/lib/cn'
 import type { SecurityDashboard as SecurityDashboardData } from '@/types'
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({
+  label,
+  value,
+  icon: Icon,
+  tone,
+}: {
+  label: string
+  value: number
+  icon: LucideIcon
+  tone: 'primary' | 'destructive' | 'warning' | 'success'
+}) {
+  const toneClass: Record<typeof tone, string> = {
+    primary: 'text-primary bg-primary/10',
+    destructive: 'text-destructive bg-destructive/10',
+    warning: 'text-amber-600 bg-amber-500/12 dark:text-amber-300',
+    success: 'text-emerald-600 bg-emerald-500/12 dark:text-emerald-300',
+  }
   return (
-    <Card className="flex flex-col gap-1 p-4">
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
-      <span className="text-2xl font-semibold">{value}</span>
+    <Card className="flex flex-col gap-3 p-4">
+      <span className={cn('flex h-8 w-8 items-center justify-center rounded-xl', toneClass[tone])}>
+        <Icon className="h-4 w-4" />
+      </span>
+      <div>
+        <span className="block text-2xl font-semibold tracking-tight">{value}</span>
+        <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      </div>
     </Card>
   )
 }
@@ -30,14 +52,14 @@ export function SecurityDashboard() {
 
   return (
     <div className="flex flex-col gap-4" data-testid="security-dashboard">
-      <h1 className="text-2xl font-semibold">Dashboard di Sicurezza</h1>
+      <h1 className="text-2xl font-semibold tracking-tight">Dashboard di Sicurezza</h1>
       <Alert variant="info">Questa sezione analizza le tue password per identificare potenziali rischi.</Alert>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Metric label="Credenziali totali" value={data.total_credentials} />
-        <Metric label="Password deboli" value={data.weak_count} />
-        <Metric label="Riutilizzate" value={data.reused_count} />
-        <Metric label="Anziane (>1 anno)" value={data.old_count} />
+        <Metric label="Credenziali totali" value={data.total_credentials} icon={KeyRound} tone="primary" />
+        <Metric label="Password deboli" value={data.weak_count} icon={ShieldAlert} tone="destructive" />
+        <Metric label="Riutilizzate" value={data.reused_count} icon={RefreshCcw} tone="warning" />
+        <Metric label="Anziane (>1 anno)" value={data.old_count} icon={Clock3} tone="warning" />
       </div>
 
       <Card>
@@ -102,7 +124,6 @@ export function SecurityDashboard() {
           ) : (
             <>
               <Alert variant="warning">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 Trovate {data.old_passwords.length} password non aggiornate da più di un anno. Considera di
                 cambiarle.
               </Alert>

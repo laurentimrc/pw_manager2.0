@@ -55,7 +55,7 @@ export function CredentialList({ onCountChanged }: { onCountChanged: (total: num
           />
         </div>
         <select
-          className="h-10 rounded-xl border border-input bg-background px-3 text-sm shadow-sm transition-[box-shadow] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+          className="h-10 rounded-xl border border-input bg-background px-3 text-sm shadow-[inset_0_1px_2px_rgba(0,0,0,0.05)] transition-[box-shadow,border-color] duration-150 ease-[var(--ease-standard)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background dark:shadow-[inset_0_1px_2px_rgba(0,0,0,0.35)]"
           value={sortBy}
           onChange={(e) => setSortBy(e.target.value as SortBy)}
           data-testid="sort-select"
