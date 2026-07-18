@@ -1,7 +1,9 @@
 import base64
 import hashlib
 import os
+import urllib.error
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 import pyotp
 import pytest
@@ -10,6 +12,7 @@ from cryptography.fernet import Fernet
 from password_manager import (
     PBKDF2_ITERATIONS,
     PasswordManager,
+    check_password_breach,
     compute_security_flags,
     generate_random_password,
     generate_recovery_code,
@@ -422,6 +425,66 @@ class TestPasswordStrength:
     def test_strong_password_scores_high(self):
         _, _, score, _ = get_password_strength_feedback("Tr0ub4dor&3-correct-horse-battery")
         assert score >= 3
+
+
+class TestCheckPasswordBreach:
+    """Tutti i test qui mockano `urllib.request.urlopen`: nessuna chiamata di
+    rete reale verso l'API di HIBP viene mai fatta durante la test suite."""
+
+    @staticmethod
+    def _mock_response(body: bytes) -> MagicMock:
+        response = MagicMock()
+        response.read.return_value = body
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return response
+
+    def test_password_found_returns_breach_count(self):
+        password = "password123"
+        sha1_hash = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+        prefix, suffix = sha1_hash[:5], sha1_hash[5:]
+        body = f"{suffix}:9999999\nFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:3\n".encode("utf-8")
+
+        with patch("password_manager.urllib.request.urlopen",
+                   return_value=self._mock_response(body)) as mock_urlopen:
+            result = check_password_breach(password)
+
+        assert result == 9999999
+        # Verifica k-anonymity: nella richiesta viaggia solo il prefisso a 5
+        # caratteri, mai l'hash completo né la password in chiaro.
+        requested_url = mock_urlopen.call_args[0][0].full_url
+        assert requested_url.endswith(f"/range/{prefix}")
+        assert suffix not in requested_url
+        assert password not in requested_url
+
+    def test_password_not_found_returns_zero(self):
+        password = "a-very-unique-high-entropy-password-987!"
+        body = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:1\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:2\n"
+
+        with patch("password_manager.urllib.request.urlopen", return_value=self._mock_response(body)):
+            result = check_password_breach(password)
+
+        assert result == 0
+
+    def test_network_error_returns_none_without_raising(self):
+        with patch("password_manager.urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("nessuna connessione")):
+            result = check_password_breach("qualunque-password")
+
+        assert result is None
+
+    def test_timeout_returns_none_without_raising(self):
+        with patch("password_manager.urllib.request.urlopen", side_effect=TimeoutError("timeout")):
+            result = check_password_breach("qualunque-password")
+
+        assert result is None
+
+    def test_empty_password_returns_zero_without_network_call(self):
+        with patch("password_manager.urllib.request.urlopen") as mock_urlopen:
+            result = check_password_breach("")
+
+        assert result == 0
+        mock_urlopen.assert_not_called()
 
 
 class TestTotp:

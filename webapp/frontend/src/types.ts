@@ -65,6 +65,20 @@ export interface SecurityDashboard {
   old_passwords: string[]
 }
 
+/** Esito del controllo violazioni (HIBP Pwned Passwords) per una singola
+ * credenziale. `checked: false` significa che il controllo non è riuscito
+ * (rete assente, timeout, API non raggiungibile): è un caso diverso da
+ * "nessuna violazione trovata" e va mostrato in modo distinto. */
+export interface BreachCheckResult {
+  service: string
+  breach_count: number | null
+  checked: boolean
+}
+
+export interface BulkBreachCheckResponse {
+  results: BreachCheckResult[]
+}
+
 export type SortBy = 'name' | 'recent' | 'weakest'
 
 export interface GeneratorOptions {

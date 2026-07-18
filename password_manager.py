@@ -5,6 +5,8 @@ import os
 import random
 import secrets
 import string
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +18,12 @@ from zxcvbn import zxcvbn
 PBKDF2_ITERATIONS = 600000
 SYMBOLS = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 AMBIGUOUS_CHARACTERS = "Il1O0|'`"
+
+# Endpoint "Pwned Passwords" di Have I Been Pwned, usato con il modello
+# k-anonymity: si contatta solo con il prefisso a 5 caratteri esadecimali
+# dell'hash SHA-1 della password (vedi `check_password_breach`).
+HIBP_RANGE_URL = "https://api.pwnedpasswords.com/range/{prefix}"
+HIBP_USER_AGENT = "PasswordManagerPro-BreachCheck (k-anonymity client, no data retained)"
 
 # Alfabeto ristretto (maiuscole + cifre, senza caratteri ambigui) usato per i
 # codici di recovery: pensati per essere trascritti a mano, non digitati a
@@ -408,6 +416,64 @@ def normalize_recovery_code(code: str) -> str:
     if not code:
         return ""
     return "".join(ch for ch in code.strip().upper() if ch != "-" and not ch.isspace())
+
+
+def check_password_breach(password: str, timeout: float = 5.0) -> Optional[int]:
+    """Controlla se `password` compare in una violazione nota, usando l'API
+    pubblica "Pwned Passwords" di Have I Been Pwned con il modello
+    k-anonymity: si calcola l'hash SHA-1 della password solo in locale, e in
+    rete viene inviato ESCLUSIVAMENTE il prefisso a 5 caratteri esadecimali
+    di quell'hash (`GET /range/{prefix}`). L'API risponde con l'elenco dei
+    suffissi hash che condividono quel prefisso (potenzialmente centinaia),
+    ciascuno col relativo conteggio di violazioni; il confronto col suffisso
+    della password reale avviene interamente in questo processo, mai in
+    rete. Né la password in chiaro né il suo hash SHA-1 completo lasciano
+    mai questa funzione.
+
+    Restituisce il numero di violazioni note in cui compare la password (0
+    se non risulta in nessuna) oppure `None` se il controllo non è riuscito
+    (rete assente, timeout, risposta inattesa dall'API, ecc.). Questa
+    funzione non solleva mai un'eccezione al chiamante: è un'operazione
+    intrinsecamente inaffidabile perché dipende da un servizio di terze
+    parti raggiungibile solo se c'è connettività di rete.
+    """
+    if not password:
+        return 0
+
+    sha1_hash = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1_hash[:5], sha1_hash[5:]
+
+    request = urllib.request.Request(
+        HIBP_RANGE_URL.format(prefix=prefix),
+        headers={
+            "User-Agent": HIBP_USER_AGENT,
+            # Chiede all'API risposte "imbottite" con voci fittizie, una
+            # mitigazione lato server contro l'analisi della dimensione della
+            # risposta (documentata da HIBP); non richiede alcun dato
+            # aggiuntivo da parte nostra.
+            "Add-Padding": "true",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    except Exception:
+        # Qualunque altro imprevisto (encoding, risposta malformata, ecc.):
+        # trattato come controllo non riuscito, mai come crash del chiamante.
+        return None
+
+    for line in body.splitlines():
+        line_suffix, _, count_str = line.strip().partition(":")
+        if line_suffix.strip().upper() != suffix:
+            continue
+        try:
+            return int(count_str.strip())
+        except ValueError:
+            return None
+
+    return 0
 
 
 def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:

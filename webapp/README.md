@@ -54,6 +54,15 @@ Tutta la logica vive in `password_manager.py` (condivisa con Streamlit), il back
   2. `POST /api/auth/recover` — codice + nuova master password: sblocca la DEK con la KEK di recovery, ri-avvolge la DEK con la nuova KEK master, e genera/salva un **nuovo** codice di recovery (quello usato è a uso singolo e da questo momento non è più valido). Nessuna sessione viene creata da questa chiamata: l'utente torna alla schermata di login e accede con la nuova master password.
 - `change_master_password` non ri-cripta più ogni singola credenziale: si limita a ri-avvolgere la DEK esistente con la nuova KEK master (la DEK stessa non cambia). Il codice di recovery non viene ruotato da un cambio "volontario" della master password, solo da un uso effettivo del recovery.
 
+### Controllo violazioni note (solo webapp)
+
+La Dashboard di Sicurezza include un controllo su richiesta esplicita (bottone "Controlla violazioni note") che verifica se le password salvate compaiono in violazioni di dati pubblicamente note, usando l'API "Pwned Passwords" di Have I Been Pwned (HIBP):
+
+- `check_password_breach` (in `password_manager.py`, condivisa e testata senza dipendenze da `streamlit`) calcola l'hash SHA-1 della password **solo in locale** e invia in rete esclusivamente il prefisso a 5 caratteri esadecimali di quell'hash (modello **k-anonymity**, `GET https://api.pwnedpasswords.com/range/{prefix}`); il confronto col suffisso della password reale avviene interamente nel processo backend. Né la password in chiaro né l'hash SHA-1 completo lasciano mai il processo, in nessun log o risposta HTTP.
+- Usa `urllib.request` della standard library (nessuna nuova dipendenza runtime: il modulo `password_manager.py` non aveva finora alcuna dipendenza di rete). Non solleva mai eccezioni verso il chiamante: un fallimento (rete assente, timeout, API non raggiungibile) restituisce `None`, distinto dal conteggio `0` ("nessuna violazione nota").
+- `POST /api/credentials/{service}/breach-check` controlla una singola credenziale; `POST /api/security/breach-check` controlla tutte le credenziali in un'unica azione esplicita, deduplicando le password uguali (una sola chiamata HIBP per le password riutilizzate) e senza bloccare le altre se una chiamata fallisce. **Nessuno dei due endpoint fa mai un controllo automatico al caricamento della dashboard**, sia per rispetto verso un'API gratuita di terzi sia per non introdurre round-trip di rete non richiesti.
+- Il frontend distingue visivamente tre stati per credenziale: *trovata in N violazioni*, *nessuna violazione nota*, *controllo non riuscito* (quest'ultimo non va mai confuso col secondo: significa solo che non è stato possibile verificare, non che la password sia sicura).
+
 ## Avvio in sviluppo
 
 ### Backend (porta 8000, solo 127.0.0.1)

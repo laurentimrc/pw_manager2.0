@@ -12,7 +12,7 @@ ampia.
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 # Permette di importare `password_manager` dalla radice del repository senza
 # duplicarne il codice. app/main.py -> app -> backend -> webapp -> radice.
@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 
 from password_manager import (  # noqa: E402  (import dopo la manipolazione di sys.path)
     PasswordManager,
+    check_password_breach,
     compute_security_flags,
     generate_random_password,
     generate_totp_code,
@@ -392,6 +393,63 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "reused_passwords": reused_passwords,
             "old_passwords": old_passwords,
         }
+
+    # --- Controllo violazioni note (HIBP Pwned Passwords, k-anonymity) ---
+    # Va invocato solo su azione esplicita dell'utente (un bottone in
+    # Dashboard Sicurezza), mai in automatico al caricamento della pagina:
+    # è un controllo verso un'API pubblica di terzi, con un round-trip di
+    # rete per ogni password (o gruppo di password uguali) da controllare.
+    # `check_password_breach` invia in rete solo un prefisso a 5 caratteri
+    # dell'hash SHA-1: né la password né l'hash completo lasciano mai questo
+    # processo (vedi password_manager.py). Questi endpoint, a loro volta,
+    # non restituiscono mai la password al frontend: solo il conteggio delle
+    # violazioni (o l'indicazione che il controllo non è riuscito).
+    @app.post("/api/credentials/{service}/breach-check")
+    def check_credential_breach(service: str, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        decrypted = manager.get_decrypted_passwords() or {}
+        if service not in decrypted:
+            raise HTTPException(status_code=404, detail="Servizio non trovato.")
+        password = decrypted[service].get("password")
+        if not password or "ERRORE" in password:
+            raise HTTPException(status_code=400, detail="Impossibile decriptare la password per questo servizio.")
+        breach_count = check_password_breach(password)
+        return {"service": service, "breach_count": breach_count, "checked": breach_count is not None}
+
+    @app.post("/api/security/breach-check")
+    def check_all_credentials_breach(session: SessionData = Depends(require_session)):
+        """Controlla tutte le credenziali in un'unica azione esplicita.
+        Deduplica per password: se più servizi condividono la stessa
+        password (già segnalato come 'reused' in dashboard), viene fatta una
+        sola chiamata HIBP per quel gruppo. Il fallimento del controllo su
+        una password (rete assente, timeout) non blocca il controllo delle
+        altre: viene semplicemente segnalato come 'checked: false' per i
+        servizi coinvolti, mentre gli altri procedono normalmente."""
+        manager = manager_for_session(session)
+        decrypted = manager.get_decrypted_passwords() or {}
+
+        password_to_services: Dict[str, List[str]] = {}
+        for service, data in decrypted.items():
+            pwd = data.get("password")
+            if pwd and "ERRORE" not in pwd:
+                password_to_services.setdefault(pwd, []).append(service)
+
+        results = []
+        for pwd, services in password_to_services.items():
+            breach_count = check_password_breach(pwd)
+            checked = breach_count is not None
+            for service in services:
+                results.append({"service": service, "breach_count": breach_count, "checked": checked})
+
+        checked_services = {r["service"] for r in results}
+        for service in decrypted:
+            if service not in checked_services:
+                # Credenziale non decriptabile ("ERRORE DI DECRIPTAZIONE"): non
+                # esiste una password valida da controllare.
+                results.append({"service": service, "breach_count": None, "checked": False})
+
+        results.sort(key=lambda r: r["service"].lower())
+        return {"results": results}
 
     # --- Utility: export / import / cambio master password ---
     @app.get("/api/utility/export")

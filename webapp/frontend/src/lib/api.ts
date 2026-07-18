@@ -1,6 +1,8 @@
 import type {
   AuthResult,
   AuthStatus,
+  BreachCheckResult,
+  BulkBreachCheckResponse,
   CredentialListResponse,
   CredentialSecret,
   GeneratorOptions,
@@ -116,6 +118,12 @@ export const api = {
     request<{ deleted: string }>(`/api/credentials/${encodeURIComponent(service)}`, { method: 'DELETE' }),
 
   getSecurityDashboard: () => request<SecurityDashboard>('/api/security/dashboard'),
+  checkCredentialBreach: (service: string) =>
+    request<BreachCheckResult>(`/api/credentials/${encodeURIComponent(service)}/breach-check`, {
+      method: 'POST',
+    }),
+  checkAllCredentialsBreach: () =>
+    request<BulkBreachCheckResponse>('/api/security/breach-check', { method: 'POST' }),
 
   exportDb: () => request<Record<string, unknown>>('/api/utility/export'),
   importDb: (data: Record<string, unknown>, confirm: boolean) =>

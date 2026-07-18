@@ -1,4 +1,5 @@
 import time
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -248,6 +249,96 @@ class TestSecurityDashboard:
         assert body["total_credentials"] == 3
         assert body["reused_count"] == 1
         assert body["weak_count"] >= 1
+
+
+class TestBreachCheck:
+    """`check_password_breach` viene sempre mockato a livello di dominio: non
+    serve (e non si deve) contattare l'HIBP reale per testare l'endpoint."""
+
+    def test_single_credential_requires_authentication(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.post("/api/credentials/GitHub/breach-check")
+        assert resp.status_code == 401
+
+    def test_single_credential_reports_breach_count(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.post("/api/credentials", json={"service": "GitHub", "username": "a", "password": "hunter2-Strong!"})
+
+        with patch("app.main.check_password_breach", return_value=42) as mocked:
+            resp = client.post("/api/credentials/GitHub/breach-check")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["service"] == "GitHub"
+        assert body["breach_count"] == 42
+        assert body["checked"] is True
+        # La password decriptata viene passata alla funzione di dominio, ma
+        # non deve mai comparire nella risposta HTTP al frontend.
+        mocked.assert_called_once_with("hunter2-Strong!")
+        assert "password" not in body
+        assert "hunter2-Strong!" not in resp.text
+
+    def test_single_credential_not_found(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        with patch("app.main.check_password_breach") as mocked:
+            resp = client.post("/api/credentials/DoesNotExist/breach-check")
+        assert resp.status_code == 404
+        mocked.assert_not_called()
+
+    def test_single_credential_network_failure_is_reported_distinctly(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.post("/api/credentials", json={"service": "GitHub", "username": "a", "password": "hunter2-Strong!"})
+
+        with patch("app.main.check_password_breach", return_value=None):
+            resp = client.post("/api/credentials/GitHub/breach-check")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["breach_count"] is None
+        assert body["checked"] is False
+
+    def test_bulk_check_requires_authentication(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.post("/api/security/breach-check")
+        assert resp.status_code == 401
+
+    def test_bulk_check_deduplicates_identical_passwords(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.post("/api/credentials", json={"service": "A", "username": "a", "password": "SamePassword123!"})
+        client.post("/api/credentials", json={"service": "B", "username": "b", "password": "SamePassword123!"})
+        client.post("/api/credentials", json={"service": "C", "username": "c", "password": "DifferentPass456!"})
+
+        with patch("app.main.check_password_breach", return_value=7) as mocked:
+            resp = client.post("/api/security/breach-check")
+        assert resp.status_code == 200
+        # Una sola chiamata di rete per la password condivisa da A e B, una
+        # per quella di C: due chiamate in totale, non tre.
+        assert mocked.call_count == 2
+        results = {r["service"]: r for r in resp.json()["results"]}
+        assert results["A"]["breach_count"] == 7
+        assert results["B"]["breach_count"] == 7
+        assert results["C"]["breach_count"] == 7
+        assert all(r["checked"] for r in results.values())
+
+    def test_bulk_check_partial_failure_does_not_block_other_results(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.post("/api/credentials", json={"service": "A", "username": "a", "password": "PasswordOne123!"})
+        client.post("/api/credentials", json={"service": "B", "username": "b", "password": "PasswordTwo456!"})
+
+        def fake_check(password: str):
+            return None if password == "PasswordOne123!" else 3
+
+        with patch("app.main.check_password_breach", side_effect=fake_check):
+            resp = client.post("/api/security/breach-check")
+        assert resp.status_code == 200
+        results = {r["service"]: r for r in resp.json()["results"]}
+        assert results["A"]["checked"] is False
+        assert results["A"]["breach_count"] is None
+        assert results["B"]["checked"] is True
+        assert results["B"]["breach_count"] == 3
 
 
 class TestUtility:
