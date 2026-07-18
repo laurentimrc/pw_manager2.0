@@ -147,6 +147,41 @@ class TestSessionTimeout:
         assert resp.json()["detail"]["code"] == "session_expired"
 
 
+class TestVaultCorruption:
+    """Un vault_key.json corrotto/manomesso deve produrre un errore pulito
+    e intenzionale (VaultCorruptedError -> 500 con un messaggio chiaro), non
+    un'eccezione grezza non gestita che finisce nell'handler generico di
+    FastAPI."""
+
+    def test_login_with_corrupted_key_file_returns_clean_error(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.cookies.clear()
+
+        key_file = tmp_path / "vault_key.json"
+        key_file.write_text('{"version": 2, "dek_wrapped_by_master": "not-a-valid-fernet-token"}')
+
+        resp = client.post("/api/auth/login", json={"password": MASTER_PASSWORD})
+        assert resp.status_code == 500
+        # Il messaggio deve restare quello intenzionale che abbiamo scritto,
+        # non un dump generico né uno stack trace.
+        assert "corrotto" in resp.text.lower()
+        assert "Traceback" not in resp.text
+        assert str(tmp_path) not in resp.text
+
+    def test_setup_with_preexisting_corrupted_key_file_returns_clean_error(self, tmp_path):
+        key_file = tmp_path / "vault_key.json"
+        key_file.write_text('{"version": 2, "dek_wrapped_by_master": "not-a-valid-fernet-token"}')
+
+        client = make_client(tmp_path)
+        resp = client.post("/api/auth/setup", json={
+            "new_password": MASTER_PASSWORD, "confirm_password": MASTER_PASSWORD,
+        })
+        assert resp.status_code == 500
+        assert "corrotto" in resp.text.lower()
+        assert "Traceback" not in resp.text
+
+
 class TestCredentialsCrud:
     def _authed_client(self, tmp_path) -> TestClient:
         client = make_client(tmp_path)
@@ -500,6 +535,83 @@ class TestRecovery:
         secret = client.get("/api/credentials/GitHub/secret")
         assert secret.status_code == 200
         assert secret.json()["password"] == "hunter2-Strong!"
+
+
+class TestRecoveryLockout:
+    """Il codice di recovery ha entropia molto alta, ma il guard esiste
+    comunque per difesa in profondità: nessun contatore su un endpoint che
+    tenta di indovinare un segreto è un gap, indipendentemente da quanto sia
+    difficile indovinarlo in pratica."""
+
+    def _setup(self, tmp_path, **overrides):
+        client = make_client(tmp_path, **overrides)
+        resp = client.post("/api/auth/setup", json={
+            "new_password": MASTER_PASSWORD, "confirm_password": MASTER_PASSWORD,
+        })
+        return client, resp.json()["recovery_code"]
+
+    def test_verify_locks_out_after_max_attempts(self, tmp_path):
+        client, _ = self._setup(tmp_path, max_login_attempts=3, lockout_seconds=5)
+
+        for _ in range(2):
+            resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+            assert resp.status_code == 400
+
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+        assert resp.status_code == 423
+        assert resp.json()["detail"]["code"] == "locked_out"
+
+    def test_lockout_blocks_the_correct_code_too(self, tmp_path):
+        client, recovery_code = self._setup(tmp_path, max_login_attempts=3, lockout_seconds=5)
+        for _ in range(3):
+            client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": recovery_code})
+        assert resp.status_code == 423
+
+    def test_lockout_is_shared_between_verify_and_complete_endpoints(self, tmp_path):
+        # Un attaccante non deve poter aggirare il lockout distribuendo i
+        # tentativi tra i due endpoint di recovery.
+        client, _ = self._setup(tmp_path, max_login_attempts=3, lockout_seconds=5)
+
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+        assert resp.status_code == 400
+        resp = client.post("/api/auth/recover", json={
+            "recovery_code": "0000-0000-0000-0000-0000",
+            "new_password": "Brand-New-Master-Pass-99!",
+            "confirm_password": "Brand-New-Master-Pass-99!",
+        })
+        assert resp.status_code == 400
+
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+        assert resp.status_code == 423
+        assert resp.json()["detail"]["code"] == "locked_out"
+
+    def test_successful_verify_resets_the_guard(self, tmp_path):
+        client, recovery_code = self._setup(tmp_path, max_login_attempts=3, lockout_seconds=5)
+
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+        assert resp.status_code == 400
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": recovery_code})
+        assert resp.status_code == 200
+
+        # Il contatore è stato azzerato dal tentativo riuscito: altri due
+        # tentativi falliti non bloccano ancora (servirebbe un terzo).
+        for _ in range(2):
+            resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+            assert resp.status_code == 400
+
+    def test_recover_locks_out_after_max_attempts(self, tmp_path):
+        client, _ = self._setup(tmp_path, max_login_attempts=3, lockout_seconds=5)
+
+        for _ in range(3):
+            resp = client.post("/api/auth/recover", json={
+                "recovery_code": "0000-0000-0000-0000-0000",
+                "new_password": "Brand-New-Master-Pass-99!",
+                "confirm_password": "Brand-New-Master-Pass-99!",
+            })
+        assert resp.status_code == 423
+        assert resp.json()["detail"]["code"] == "locked_out"
 
 
 class TestRegenerateRecoveryCode:

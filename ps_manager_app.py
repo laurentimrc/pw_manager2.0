@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from password_manager import (
     PasswordManager,
+    VaultCorruptedError,
     compute_security_flags,
     get_password_strength_feedback,
     generate_random_password,
@@ -343,7 +344,12 @@ def main():
             return
         st.session_state.last_activity = datetime.now()
 
-        manager.derive_and_set_cipher(st.session_state.master_password_cache, kdf_salt)
+        try:
+            manager.derive_and_set_cipher(st.session_state.master_password_cache, kdf_salt)
+        except VaultCorruptedError:
+            st.error("Il materiale crittografico del vault (vault_key.json) risulta corrotto o illeggibile. "
+                     "Ripristina un backup o contatta l'amministratore.")
+            st.stop()
 
         decrypted_passwords = manager.get_decrypted_passwords()
         if decrypted_passwords is None:
