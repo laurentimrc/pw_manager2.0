@@ -1,0 +1,8 @@
+# Il backend riusa password_manager.py dalla radice del repository: installare
+# anche requirements.txt della radice (bcrypt, cryptography, pyotp, zxcvbn-python).
+fastapi
+uvicorn[standard]
+
+# Solo per eseguire i test (webapp/backend/tests/):
+httpx
+pytest

@@ -1,284 +1,247 @@
 import streamlit as st
 import json
-import os
-import bcrypt
-import base64
-import hashlib
-import random
-import string
-import pyotp  # <-- NUOVO
-import time  # <-- NUOVO
-from cryptography.fernet import Fernet
-from zxcvbn import zxcvbn
-from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timedelta
 
+from password_manager import (
+    PasswordManager,
+    compute_security_flags,
+    get_password_strength_feedback,
+    generate_random_password,
+    generate_totp_code,
+    sort_credentials,
+    validate_imported_db,
+)
+
+FLAG_LABELS = {"weak": "⚠️ Debole", "reused": "🔁 Riutilizzata", "old": "🗓️ Anziana"}
+
 # --- CONFIGURAZIONE INIZIALE STREAMLIT ---
-st.set_page_config(page_title="Password Manager Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Password Manager Pro", page_icon="🔐", layout="wide",
+                    initial_sidebar_state="expanded")
 
 # --- COSTANTI DI CONFIGURAZIONE ---
 PASSWORDS_FILE = "passwords.json"
 MASTER_HASH_FILE = "master_pwd.hash"
 KDF_SALT_FILE = "kdf.salt"
-PBKDF2_ITERATIONS = 600000
-SYMBOLS = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
-AMBIGUOUS_CHARACTERS = "Il1O0|'`"
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 60
+SESSION_INACTIVITY_TIMEOUT_SECONDS = 15 * 60
 
+CUSTOM_CSS = """
+<style>
+/* ------------------------------------------------------------------------
+   "Liquid Glass" cosmetic layer for the Streamlit interface.
+   CSS-only, injected via st.markdown: Streamlit's own widget markup and
+   behavior are untouched. Scope is intentionally limited to what a plain
+   CSS override can safely reach (colors, radii, shadows, a couple of
+   translucent/blurred "chrome" surfaces) - see the design review notes for
+   what this platform does not allow (no control over widget internals, no
+   true modal dialogs, no reliable mount/expand animations because Streamlit
+   re-executes the whole script on every interaction).
 
-# --- CLASSE DI GESTIONE LOGICA ---
-class PasswordManager:
-    """
-    Incapsula tutta la logica di gestione delle password.
-    """
+   Streamlit's default (unconfigured) theme already follows the OS light/dark
+   preference, so every color below is duplicated under
+   prefers-color-scheme: dark to stay consistent with that behavior instead
+   of fighting it via .streamlit/config.toml (which would pin the theme and
+   break the automatic switch - not something this pass touches).
+   ------------------------------------------------------------------------ */
 
-    def __init__(self, hash_file: str, salt_file: str, db_file: str):
-        self.hash_file = hash_file
-        self.salt_file = salt_file
-        self.db_file = db_file
-        self.cipher_suite: Optional[Fernet] = None
+:root {
+    --pwm-glass-blur: 22px;
+}
 
-    # ... (metodi hash, salt, KDF...) ...
-    def master_hash_exists(self) -> bool:
-        return os.path.exists(self.hash_file)
-
-    def load_master_hash(self) -> Optional[bytes]:
-        if not self.master_hash_exists(): return None
-        with open(self.hash_file, "rb") as f:
-            return f.read()
-
-    def set_master_hash(self, password: str) -> None:
-        salt = bcrypt.gensalt()
-        hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt)
-        with open(self.hash_file, "wb") as f:
-            f.write(hashed_password)
-
-    def verify_master_password(self, password: str) -> bool:
-        stored_hash = self.load_master_hash()
-        if not password or not stored_hash: return False
-        try:
-            return bcrypt.checkpw(password.encode('utf-8'), stored_hash)
-        except ValueError:
-            return False
-
-    def load_kdf_salt(self) -> Optional[bytes]:
-        if not os.path.exists(self.salt_file): return None
-        with open(self.salt_file, "rb") as f:
-            return f.read()
-
-    def generate_and_save_kdf_salt(self) -> bytes:
-        salt = os.urandom(16)
-        with open(self.salt_file, "wb") as f:
-            f.write(salt)
-        return salt
-
-    def derive_and_set_cipher(self, master_password: str, salt: bytes) -> None:
-        key = hashlib.pbkdf2_hmac('sha256', master_password.encode('utf-8'), salt, PBKDF2_ITERATIONS, dklen=32)
-        fernet_key = base64.urlsafe_b64encode(key)
-        self.cipher_suite = Fernet(fernet_key)
-
-    # --- Gestione Database ---
-    def load_encrypted_db(self) -> Dict[str, Any]:
-        try:
-            with open(self.db_file, "r") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    def save_encrypted_db(self, data: Dict[str, Any]) -> None:
-        with open(self.db_file, "w") as f:
-            json.dump(data, f, indent=4)
-
-    def get_decrypted_passwords(self) -> Optional[Dict[str, Dict[str, str]]]:
-        if not self.cipher_suite: return None
-
-        encrypted_db = self.load_encrypted_db()
-        decrypted_data = {}
-        for service, credentials in encrypted_db.items():
-            try:
-                decrypted_password = self.cipher_suite.decrypt(credentials['password_criptata'].encode()).decode()
-
-                # NUOVA LOGICA TOTP
-                decrypted_totp = ""
-                if credentials.get("totp_secret_criptato"):
-                    decrypted_totp = self.cipher_suite.decrypt(credentials['totp_secret_criptato'].encode()).decode()
-
-                decrypted_data[service] = {
-                    "username": credentials['username'],
-                    "password": decrypted_password,
-                    "last_updated": credentials.get("last_updated"),
-                    "totp_secret": decrypted_totp  # Aggiunto
-                }
-            except Exception:
-                decrypted_data[service] = {"password": "ERRORE DI DECRIPTAZIONE"}
-        return decrypted_data
-
-    def add_credential(self, service: str, username: str, password: str, totp_secret: str = "") -> bool:
-        if not self.cipher_suite: return False
-
-        encrypted_password = self.cipher_suite.encrypt(password.encode()).decode()
-
-        # NUOVA LOGICA TOTP
-        encrypted_totp = ""
-        if totp_secret:
-            encrypted_totp = self.cipher_suite.encrypt(totp_secret.encode()).decode()
-
-        db = self.load_encrypted_db()
-        db[service] = {
-            "username": username,
-            "password_criptata": encrypted_password,
-            "last_updated": datetime.now().isoformat(),
-            "totp_secret_criptato": encrypted_totp  # Aggiunto
-        }
-        self.save_encrypted_db(db)
-        return True
-
-    def update_credential(self, service: str, new_username: str, new_password: str, new_totp_secret: str = "") -> bool:
-        # L'aggiornamento ora rinnova anche il timestamp e il TOTP
-        return self.add_credential(service, new_username, new_password, new_totp_secret)
-
-    def delete_credential(self, service: str) -> None:
-        db = self.load_encrypted_db()
-        if service in db:
-            del db[service]
-            self.save_encrypted_db(db)
-
-    def change_master_password(self, old_password: str, new_password: str) -> Tuple[bool, str]:
-        if not self.verify_master_password(old_password):
-            return False, "La vecchia Master Password è errata."
-
-        old_salt = self.load_kdf_salt()
-        if not old_salt:
-            return False, "File salt KDF non trovato. Annullamento."
-
-        old_key = hashlib.pbkdf2_hmac('sha256', old_password.encode('utf-8'), old_salt, PBKDF2_ITERATIONS, dklen=32)
-        old_fernet_key = base64.urlsafe_b64encode(old_key)
-        old_cipher = Fernet(old_fernet_key)
-
-        encrypted_db = self.load_encrypted_db()
-        decrypted_data_map = {}
-
-        for service, credentials in encrypted_db.items():
-            try:
-                decrypted_password = old_cipher.decrypt(credentials['password_criptata'].encode()).decode()
-
-                # LOGICA TOTP AGGIORNATA
-                decrypted_totp = ""
-                if credentials.get("totp_secret_criptato"):
-                    decrypted_totp = old_cipher.decrypt(credentials['totp_secret_criptato'].encode()).decode()
-
-                decrypted_data_map[service] = {
-                    "username": credentials['username'],
-                    "password": decrypted_password,
-                    "totp_secret": decrypted_totp,  # Aggiunto
-                    "last_updated": credentials.get("last_updated")
-                }
-            except Exception:
-                return False, f"Errore di decriptazione per '{service}'. Annullamento."
-
-        self.set_master_hash(new_password)
-        new_salt = self.generate_and_save_kdf_salt()
-        new_key = hashlib.pbkdf2_hmac('sha256', new_password.encode('utf-8'), new_salt, PBKDF2_ITERATIONS, dklen=32)
-        new_fernet_key = base64.urlsafe_b64encode(new_key)
-        new_cipher = Fernet(new_fernet_key)
-
-        new_encrypted_db = {}
-        for service, data in decrypted_data_map.items():
-            try:
-                encrypted_password = new_cipher.encrypt(data['password'].encode()).decode()
-
-                # LOGICA TOTP AGGIORNATA
-                encrypted_totp = ""
-                if data.get("totp_secret"):
-                    encrypted_totp = new_cipher.encrypt(data['totp_secret'].encode()).decode()
-
-                new_encrypted_db[service] = {
-                    "username": data['username'],
-                    "password_criptata": encrypted_password,
-                    "totp_secret_criptato": encrypted_totp,  # Aggiunto
-                    "last_updated": data.get("last_updated") or datetime.now().isoformat()
-                }
-            except Exception as e:
-                return False, f"Errore durante la ri-crittografia per '{service}': {e}"
-
-        self.save_encrypted_db(new_encrypted_db)
-        self.cipher_suite = new_cipher
-
-        return True, "Master Password cambiata con successo!"
-
-
-# --- Funzioni Helper UI ---
-def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:
-    if not password: return "", "", 0, "grey"
-    results = zxcvbn(password)
-    score = results['score']
-    feedback_text = results.get('feedback', {}).get('warning', '')
-    suggestions = " ".join(results.get('feedback', {}).get('suggestions', []))
-    full_feedback = f"{feedback_text} {suggestions}".strip()
-
-    strength_map = {
-        0: ("Pessima 😱", "red"), 1: ("Debole 😟", "orange"), 2: ("Discreta 🤔", "yellow"),
-        3: ("Buona 😊", "green"), 4: ("Ottima! 💪", "darkgreen")
+/* Ambient background wash so the translucent surfaces below have something
+   to refract - otherwise a backdrop-blur over a flat white/near-black page
+   is invisible. */
+div[data-testid="stApp"] {
+    background-image:
+        radial-gradient(circle at 12% 6%, rgba(91, 79, 233, 0.10), transparent 45%),
+        radial-gradient(circle at 90% 94%, rgba(91, 79, 233, 0.07), transparent 50%);
+    background-attachment: fixed;
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stApp"] {
+        background-image:
+            radial-gradient(circle at 12% 6%, rgba(129, 121, 255, 0.18), transparent 45%),
+            radial-gradient(circle at 90% 94%, rgba(129, 121, 255, 0.11), transparent 50%);
     }
-    strength_text, color = strength_map.get(score, ("Sconosciuta", "grey"))
-    return strength_text, full_feedback, score, color
+}
 
-
-def generate_random_password(length: int, use_upper: bool, use_lower: bool, use_digits: bool, use_symbols: bool,
-                             exclude_ambiguous: bool) -> str:
-    char_pool, guaranteed_chars = [], []
-
-    def filter_ambiguous(char_set: str) -> str:
-        return "".join(c for c in char_set if c not in AMBIGUOUS_CHARACTERS) if exclude_ambiguous else char_set
-
-    sets = {
-        "upper": (use_upper, filter_ambiguous(string.ascii_uppercase)),
-        "lower": (use_lower, filter_ambiguous(string.ascii_lowercase)),
-        "digits": (use_digits, filter_ambiguous(string.digits)),
-        "symbols": (use_symbols, filter_ambiguous(SYMBOLS))
+/* Sidebar: the one persistent "chrome" surface in this app - a legitimate
+   glass-material target (unlike list rows, it's a single instance). */
+div[data-testid="stSidebar"] {
+    background: rgba(255, 255, 255, 0.6) !important;
+    -webkit-backdrop-filter: blur(var(--pwm-glass-blur)) saturate(160%);
+    backdrop-filter: blur(var(--pwm-glass-blur)) saturate(160%);
+    border-right: 1px solid rgba(255, 255, 255, 0.5);
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stSidebar"] {
+        background: rgba(20, 22, 30, 0.55) !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
     }
-    for use_flag, char_set in sets.values():
-        if use_flag and char_set:
-            char_pool.extend(list(char_set))
-            guaranteed_chars.append(random.choice(char_set))
-    if not char_pool: return ""
-    remaining_len = length - len(guaranteed_chars)
-    if remaining_len < 0:
-        random.shuffle(guaranteed_chars)
-        return "".join(guaranteed_chars[:length])
-    password_fill = random.choices(char_pool, k=remaining_len)
-    final_password_list = guaranteed_chars + password_fill
-    random.shuffle(final_password_list)
-    return "".join(final_password_list)
+}
+
+/* Forms are this app's "cards" (login, setup, add/edit credential, change
+   master password, import/export) - always a single instance on screen at
+   a time, never a repeated list row, so a real glass material is safe. */
+div[data-testid="stForm"] {
+    border-radius: 20px !important;
+    border: 1px solid rgba(255, 255, 255, 0.5) !important;
+    background: rgba(255, 255, 255, 0.66) !important;
+    -webkit-backdrop-filter: blur(var(--pwm-glass-blur)) saturate(150%);
+    backdrop-filter: blur(var(--pwm-glass-blur)) saturate(150%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 12px 32px -16px rgba(30, 20, 60, 0.18);
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stForm"] {
+        border: 1px solid rgba(255, 255, 255, 0.08) !important;
+        background: rgba(30, 32, 42, 0.62) !important;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 12px 32px -16px rgba(0, 0, 0, 0.5);
+    }
+}
+
+/* The outer st.container(border=True) wrapping the login/setup form would
+   otherwise draw a second, redundant box around the glass card above - make
+   it invisible chrome instead. */
+div[data-testid="stVerticalBlock"]:has(> div[data-testid="stLayoutWrapper"] > div[data-testid="stForm"]) {
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+}
+
+/* Credential rows AND the dashboard risk categories both use st.expander,
+   and a credential list can get long - so this stays a plain OPAQUE
+   elevated surface on purpose, no backdrop-filter, to avoid a per-row blur
+   cost while scrolling. */
+div[data-testid="stExpander"] {
+    border-radius: 18px;
+    border: 1px solid rgba(128, 128, 128, 0.18);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 8px 20px -14px rgba(0, 0, 0, 0.18);
+    overflow: hidden;
+}
+
+/* Dashboard KPI tiles: a small, fixed-size group of 4 - a light glass
+   treatment is fine here since it never repeats into a long list. */
+div[data-testid="stMetric"] {
+    background: rgba(255, 255, 255, 0.55) !important;
+    -webkit-backdrop-filter: blur(14px) saturate(150%);
+    backdrop-filter: blur(14px) saturate(150%);
+    border-radius: 16px;
+    padding: 0.7rem 1.1rem;
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stMetric"] {
+        background: rgba(30, 32, 42, 0.55) !important;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+}
+
+/* Pill-shaped buttons with a light press feedback. No entrance/spring
+   animation here on purpose: Streamlit re-runs the whole script on every
+   interaction, so a "mount" animation on a freshly re-rendered DOM node
+   would just flash rather than feel intentional. */
+button[data-testid="stBaseButton-primary"],
+button[data-testid="stBaseButton-secondary"],
+button[data-testid="stBaseButton-primaryFormSubmit"],
+button[data-testid="stBaseButton-header"] {
+    border-radius: 999px !important;
+    transition: transform 120ms ease, box-shadow 120ms ease;
+}
+button[data-testid="stBaseButton-primary"]:active,
+button[data-testid="stBaseButton-secondary"]:active,
+button[data-testid="stBaseButton-primaryFormSubmit"]:active {
+    transform: scale(0.97);
+}
+
+/* Text inputs: generous rounding to match the pill/rounded-rect language
+   used everywhere else. */
+div[data-testid="stTextInputRootElement"] {
+    border-radius: 14px !important;
+}
+
+/* Sidebar nav ("Menu" radio): pill highlight for the selected item. */
+label[data-testid="stRadioOption"] {
+    border-radius: 12px;
+    padding: 0.2rem 0.5rem;
+    transition: background-color 120ms ease;
+}
+label[data-testid="stRadioOption"][data-selected="true"] {
+    background: rgba(91, 79, 233, 0.12);
+}
+@media (prefers-color-scheme: dark) {
+    label[data-testid="stRadioOption"][data-selected="true"] {
+        background: rgba(129, 121, 255, 0.18);
+    }
+}
+
+/* Alerts: soften corners only - colors stay Streamlit's own
+   success/warning/error/info so the semantics don't change. */
+div[data-testid="stAlertContainer"] {
+    border-radius: 14px;
+}
+
+.pwm-badge {
+    display: inline-block;
+    padding: 0.2rem 0.75rem;
+    border-radius: 999px;
+    background: rgba(255, 174, 0, 0.15);
+    color: #b9770e;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+/* Respect explicit user preferences: fall back to fully opaque surfaces
+   when the browser reports reduced transparency / increased contrast,
+   exactly like the React app does. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+    div[data-testid="stSidebar"],
+    div[data-testid="stForm"],
+    div[data-testid="stMetric"] {
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
+        background: #ffffff !important;
+    }
+}
+@media (prefers-color-scheme: dark) and (prefers-reduced-transparency: reduce),
+    (prefers-color-scheme: dark) and (prefers-contrast: more) {
+    div[data-testid="stSidebar"],
+    div[data-testid="stForm"],
+    div[data-testid="stMetric"] {
+        background: #171922 !important;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    button[data-testid="stBaseButton-primary"],
+    button[data-testid="stBaseButton-secondary"],
+    button[data-testid="stBaseButton-primaryFormSubmit"],
+    label[data-testid="stRadioOption"] {
+        transition: none !important;
+    }
+}
+</style>
+"""
 
 
 def display_strength_bar(password: str):
-    if password:
-        strength_text, feedback, _, color = get_password_strength_feedback(password)
-        st.markdown(
-            f"**Robustezza:** <span style='color:{color}; font-weight:bold;'>{strength_text}</span>. *{feedback}*",
-            unsafe_allow_html=True)
-
-
-# --- NUOVA FUNZIONE HELPER TOTP ---
-def generate_totp_code(secret: str) -> Tuple[Optional[str], int]:
-    """Genera il codice TOTP corrente e il tempo rimanente."""
-    if not secret:
-        return None, 0
-    try:
-        totp = pyotp.TOTP(secret)
-        code = totp.now()
-        # Calcola il tempo rimanente prima della prossima scadenza
-        remaining_time = totp.interval - (datetime.now().timestamp() % totp.interval)
-        return code, int(remaining_time)
-    except Exception:
-        # Spesso accade se il segreto ha un padding o un formato errato
-        return "Errore", 0
+    if not password:
+        return
+    strength_text, feedback, score, color = get_password_strength_feedback(password)
+    st.progress((score + 1) / 5)
+    feedback_suffix = f" · *{feedback}*" if feedback else ""
+    st.markdown(
+        f"**Robustezza:** <span style='color:{color}; font-weight:bold;'>{strength_text}</span>{feedback_suffix}",
+        unsafe_allow_html=True)
 
 
 # --- INTERFACCIA PRINCIPALE STREAMLIT ---
 def main():
-    st.title("🔑 Password Manager Pro")
-    st.caption("⚠️ Questo è un progetto a scopo didatto.")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    st.title("🔐 Password Manager Pro")
+    st.markdown('<span class="pwm-badge">⚠️ Progetto a scopo didattico</span>', unsafe_allow_html=True)
+    st.write("")
 
     manager = PasswordManager(MASTER_HASH_FILE, KDF_SALT_FILE, PASSWORDS_FILE)
 
@@ -287,48 +250,80 @@ def main():
         st.session_state.authenticated = False
     if "editing_service" not in st.session_state:
         st.session_state.editing_service = None
+    if "pending_delete" not in st.session_state:
+        st.session_state.pending_delete = None
 
     if not manager.master_hash_exists():
-        # ... (codice setup invariato)
-        st.subheader("🔑 Imposta la tua Master Password")
-        st.info("Benvenuto! Crea una password principale robusta.")
-        with st.form("setup_form"):
-            new_pwd = st.text_input("Nuova Master Password", type="password")
-            confirm_pwd = st.text_input("Conferma Master Password", type="password")
-            display_strength_bar(new_pwd)
-            submitted = st.form_submit_button("Imposta e Accedi")
-            if submitted:
-                _, _, score, _ = get_password_strength_feedback(new_pwd)
-                if not new_pwd or not confirm_pwd:
-                    st.error("Entrambi i campi sono obbligatori.")
-                elif len(new_pwd) < 12:
-                    st.error("La Master Password deve essere di almeno 12 caratteri.")
-                elif new_pwd != confirm_pwd:
-                    st.error("Le password non coincidono.")
-                elif score < 3:
-                    st.warning("Password debole. Scegli una combinazione più robusta.")
-                else:
-                    manager.set_master_hash(new_pwd)
-                    manager.generate_and_save_kdf_salt()
-                    st.session_state.master_password_cache = new_pwd
-                    st.session_state.authenticated = True
-                    st.success("Master Password impostata! Accesso eseguito.")
-                    st.rerun()
+        _, mid, _ = st.columns([1, 1.3, 1])
+        with mid:
+            with st.container(border=True):
+                st.subheader("🔐 Imposta la tua Master Password")
+                st.caption("Benvenuto! Crea una password principale robusta per proteggere il tuo database.")
+                with st.form("setup_form"):
+                    new_pwd = st.text_input("Nuova Master Password", type="password")
+                    confirm_pwd = st.text_input("Conferma Master Password", type="password")
+                    display_strength_bar(new_pwd)
+                    submitted = st.form_submit_button("Imposta e Accedi", use_container_width=True,
+                                                       type="primary")
+                    if submitted:
+                        _, _, score, _ = get_password_strength_feedback(new_pwd)
+                        if not new_pwd or not confirm_pwd:
+                            st.error("Entrambi i campi sono obbligatori.")
+                        elif len(new_pwd) < 12:
+                            st.error("La Master Password deve essere di almeno 12 caratteri.")
+                        elif new_pwd != confirm_pwd:
+                            st.error("Le password non coincidono.")
+                        elif score < 3:
+                            st.warning("Password debole. Scegli una combinazione più robusta.")
+                        else:
+                            manager.set_master_hash(new_pwd)
+                            manager.generate_and_save_kdf_salt()
+                            st.session_state.master_password_cache = new_pwd
+                            st.session_state.authenticated = True
+                            st.success("Master Password impostata! Accesso eseguito.")
+                            st.rerun()
 
     elif not st.session_state.authenticated:
-        # ... (codice login invariato)
-        st.subheader("Login")
-        with st.form("login_form"):
-            master_pwd_input = st.text_input("Inserisci la Master Password", type="password")
-            submitted = st.form_submit_button("Sblocca")
-            if submitted:
-                if manager.verify_master_password(master_pwd_input):
-                    st.session_state.master_password_cache = master_pwd_input
-                    st.session_state.authenticated = True
-                    st.success("Accesso effettuato!")
-                    st.rerun()
+        _, mid, _ = st.columns([1, 1.3, 1])
+        with mid:
+            with st.container(border=True):
+                st.subheader("🔓 Login")
+
+                failed_attempts = st.session_state.get("failed_login_attempts", 0)
+                lockout_until = st.session_state.get("login_lockout_until")
+                now = datetime.now()
+
+                if lockout_until and now < lockout_until:
+                    remaining = int((lockout_until - now).total_seconds())
+                    st.error(f"Troppi tentativi falliti. Riprova tra {remaining} secondi.")
                 else:
-                    st.error("Master Password errata.")
+                    if lockout_until and now >= lockout_until:
+                        st.session_state.failed_login_attempts = 0
+                        st.session_state.login_lockout_until = None
+
+                    with st.form("login_form"):
+                        master_pwd_input = st.text_input("Inserisci la Master Password", type="password")
+                        submitted = st.form_submit_button("Sblocca", use_container_width=True, type="primary")
+                        if submitted:
+                            if manager.verify_master_password(master_pwd_input):
+                                st.session_state.master_password_cache = master_pwd_input
+                                st.session_state.authenticated = True
+                                st.session_state.failed_login_attempts = 0
+                                st.session_state.login_lockout_until = None
+                                st.session_state.last_activity = datetime.now()
+                                st.success("Accesso effettuato!")
+                                st.rerun()
+                            else:
+                                st.session_state.failed_login_attempts = failed_attempts + 1
+                                if st.session_state.failed_login_attempts >= MAX_LOGIN_ATTEMPTS:
+                                    st.session_state.login_lockout_until = datetime.now() + timedelta(
+                                        seconds=LOGIN_LOCKOUT_SECONDS)
+                                    st.error(
+                                        f"Troppi tentativi falliti. Account bloccato per {LOGIN_LOCKOUT_SECONDS} secondi.")
+                                else:
+                                    remaining_attempts = MAX_LOGIN_ATTEMPTS - st.session_state.failed_login_attempts
+                                    st.error(f"Master Password errata. Tentativi rimasti: {remaining_attempts}.")
+                                st.rerun()
 
     # --- APP PRINCIPALE ---
     else:
@@ -339,29 +334,58 @@ def main():
             st.rerun()
             return
 
-        manager.derive_and_set_cipher(st.session_state.master_password_cache, kdf_salt)
-
-        st.sidebar.success("✅ Accesso Eseguito")
-        if st.sidebar.button("Blocca App", use_container_width=True, type="primary"):
-            for key in list(st.session_state.keys()): del st.session_state[key]
+        last_activity = st.session_state.get("last_activity")
+        if last_activity and (datetime.now() - last_activity).total_seconds() > SESSION_INACTIVITY_TIMEOUT_SECONDS:
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.warning("Sessione scaduta per inattività. Effettua nuovamente il login.")
             st.rerun()
+            return
+        st.session_state.last_activity = datetime.now()
 
-        st.sidebar.markdown("---")
-        menu_options = ["👀 Visualizza/Modifica", "➕ Aggiungi Nuova", "🛡️ Dashboard Sicurezza", "⚙️ Utility"]
-        scelta = st.sidebar.radio("Menu", menu_options)
+        manager.derive_and_set_cipher(st.session_state.master_password_cache, kdf_salt)
 
         decrypted_passwords = manager.get_decrypted_passwords()
         if decrypted_passwords is None:
             st.error("Impossibile decriptare i dati.")
             st.stop()
 
+        st.sidebar.markdown("### 🔐 Password Manager Pro")
+        st.sidebar.success("✅ Accesso Eseguito")
+        st.sidebar.caption(f"{len(decrypted_passwords)} credenziali salvate")
+        if st.sidebar.button("🔒 Blocca App", use_container_width=True, type="primary"):
+            for key in list(st.session_state.keys()): del st.session_state[key]
+            st.rerun()
+
+        st.sidebar.divider()
+        menu_options = ["👀 Visualizza/Modifica", "➕ Aggiungi Nuova", "🛡️ Dashboard Sicurezza", "⚙️ Utility"]
+        scelta = st.sidebar.radio("Menu", menu_options)
+
         if scelta == "👀 Visualizza/Modifica":
             st.header("Visualizza, Modifica ed Elimina Credenziali")
-            search_term = st.text_input("Cerca per Servizio", placeholder="Es. Google, Amazon...").lower()
+            search_col, sort_col = st.columns([2, 1])
+            search_term = search_col.text_input("Cerca per Servizio", placeholder="Es. Google, Amazon...").lower()
+            sort_label = sort_col.selectbox(
+                "Ordina per", ["Nome (A-Z)", "Ultima modifica", "Robustezza (più deboli prima)"])
+            sort_key = {"Nome (A-Z)": "name", "Ultima modifica": "recent",
+                        "Robustezza (più deboli prima)": "weakest"}[sort_label]
+
+            if search_term != st.session_state.get("prev_search_term", ""):
+                st.session_state.pending_delete = None
+            st.session_state.prev_search_term = search_term
+
             filtered_creds = {s: d for s, d in decrypted_passwords.items() if
                               search_term in s.lower()} if search_term else decrypted_passwords
-            if not filtered_creds: st.info("Nessuna credenziale trovata.")
-            for service, data in filtered_creds.items():
+            sorted_creds = sort_credentials(filtered_creds, sort_key)
+
+            if filtered_creds:
+                st.caption(f"{len(filtered_creds)} di {len(decrypted_passwords)} credenziali")
+            else:
+                st.info("Nessuna credenziale trovata.")
+
+            security_flags = compute_security_flags(decrypted_passwords)
+
+            for service, data in sorted_creds:
                 show_password_key = f"show_pwd_{service}"
                 if show_password_key not in st.session_state: st.session_state[show_password_key] = False
                 if st.session_state.editing_service == service:
@@ -389,11 +413,17 @@ def main():
                                 st.rerun()
                 else:
                     # --- VISTA VISUALIZZA (AGGIORNATA) ---
-                    with st.expander(f"🔑 {service}"):
-                        st.text_input("Username/Email", value=data['username'], disabled=True)
+                    service_flags = security_flags.get(service, [])
+                    label_suffix = f" — {' · '.join(FLAG_LABELS[f] for f in service_flags)}" if service_flags else ""
+
+                    with st.expander(f"🔑 {service}{label_suffix}"):
+                        st.caption("Username/Email")
+                        st.code(data['username'], language=None)
+
                         is_visible = st.session_state[show_password_key]
-                        password_to_display = data.get('password', 'ERRORE') if is_visible else "∗∗∗∗∗∗∗∗∗"
-                        st.text_input("Password", value=password_to_display, disabled=True, key=f"disp_pwd_{service}")
+                        st.caption("Password")
+                        password_to_display = data.get('password', 'ERRORE') if is_visible else "••••••••••"
+                        st.code(password_to_display, language=None)
 
                         # --- NUOVA SEZIONE TOTP ---
                         if data.get("totp_secret"):
@@ -404,7 +434,8 @@ def main():
                             if code == "Errore":
                                 totp_container.error("Formato segreto TOTP non valido.")
                             elif code:
-                                totp_container.metric(label="Codice 2FA", value=f"{code}")
+                                totp_container.caption("Codice 2FA")
+                                totp_container.code(code, language=None)
                                 totp_container.progress(remaining / 30.0, text=f"Nuovo codice tra {remaining}s")
                                 if totp_container.button("🔄 Aggiorna Codice", key=f"refresh_totp_{service}",
                                                          help="Forza l'aggiornamento del codice"):
@@ -414,19 +445,32 @@ def main():
                         # --- FINE SEZIONE TOTP ---
 
                         st.markdown("---")  # Separatore visuale
-                        c1, c2, c3 = st.columns(3)
-                        button_label = "Nascondi Password" if is_visible else "Mostra Password"
-                        if c1.button(button_label, key=f"toggle_{service}"):
-                            st.session_state[show_password_key] = not st.session_state[show_password_key]
-                            st.rerun()
-                        if c2.button("Modifica", key=f"edit_{service}"):
-                            st.session_state[show_password_key] = False  # Nascondi pwd prima di modificare
-                            st.session_state.editing_service = service
-                            st.rerun()
-                        if c3.button("🗑️ Elimina", key=f"del_{service}", type="primary"):
-                            manager.delete_credential(service)
-                            st.success(f"Credenziale per '{service}' eliminata.")
-                            st.rerun()
+
+                        if st.session_state.get("pending_delete") == service:
+                            st.warning(f"Confermi l'eliminazione di **{service}**? L'azione è irreversibile.")
+                            dc1, dc2 = st.columns(2)
+                            if dc1.button("✅ Conferma eliminazione", key=f"confirm_del_{service}",
+                                         type="primary", use_container_width=True):
+                                manager.delete_credential(service)
+                                st.session_state.pending_delete = None
+                                st.success(f"Credenziale per '{service}' eliminata.")
+                                st.rerun()
+                            if dc2.button("Annulla", key=f"cancel_del_{service}", use_container_width=True):
+                                st.session_state.pending_delete = None
+                                st.rerun()
+                        else:
+                            c1, c2, c3 = st.columns(3)
+                            button_label = "Nascondi Password" if is_visible else "Mostra Password"
+                            if c1.button(button_label, key=f"toggle_{service}"):
+                                st.session_state[show_password_key] = not st.session_state[show_password_key]
+                                st.rerun()
+                            if c2.button("Modifica", key=f"edit_{service}"):
+                                st.session_state[show_password_key] = False  # Nascondi pwd prima di modificare
+                                st.session_state.editing_service = service
+                                st.rerun()
+                            if c3.button("🗑️ Elimina", key=f"del_{service}"):
+                                st.session_state.pending_delete = service
+                                st.rerun()
 
         elif scelta == "➕ Aggiungi Nuova":
             st.header("Aggiungi Nuova Credenziale")
@@ -443,7 +487,9 @@ def main():
                     st.session_state.add_password_value = generate_random_password(length, use_upper, use_lower,
                                                                                    use_digits, use_symbols,
                                                                                    exclude_ambiguous)
-            if 'add_password_value' in st.session_state: st.code(st.session_state.add_password_value)
+            if 'add_password_value' in st.session_state:
+                st.code(st.session_state.add_password_value, language=None)
+                display_strength_bar(st.session_state.add_password_value)
 
             # --- FORM AGGIUNGI (AGGIORNATO) ---
             with st.form("add_credential_form"):
@@ -473,18 +519,33 @@ def main():
                             st.error("Errore durante il salvataggio.")
 
         elif scelta == "🛡️ Dashboard Sicurezza":
-            # ... (codice dashboard invariato) ...
             st.header("🛡️ Dashboard di Sicurezza")
             st.info("Questa sezione analizza le tue password per identificare potenziali rischi.")
+
+            security_flags = compute_security_flags(decrypted_passwords)
+
+            password_map = {}
+            weak_passwords = []
+            old_passwords = []
+            for service, data in decrypted_passwords.items():
+                pwd = data.get('password')
+                if pwd and "ERRORE" not in pwd:
+                    password_map.setdefault(pwd, []).append(service)
+                    if "weak" in security_flags.get(service, []):
+                        _, _, score, _ = get_password_strength_feedback(pwd)
+                        weak_passwords.append((service, score))
+                if "old" in security_flags.get(service, []):
+                    old_passwords.append(service)
+            reused_passwords = {pwd: services for pwd, services in password_map.items() if len(services) > 1}
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Credenziali totali", len(decrypted_passwords))
+            m2.metric("Password deboli", len(weak_passwords))
+            m3.metric("Riutilizzate", len(reused_passwords))
+            m4.metric("Anziane (>1 anno)", len(old_passwords))
+            st.write("")
+
             with st.expander("🚨 Password Riutilizzate", expanded=True):
-                password_map = {}
-                for service, data in decrypted_passwords.items():
-                    pwd = data.get('password')
-                    if not pwd or "ERRORE" in pwd: continue
-                    if pwd not in password_map:
-                        password_map[pwd] = []
-                    password_map[pwd].append(service)
-                reused_passwords = {pwd: services for pwd, services in password_map.items() if len(services) > 1}
                 if not reused_passwords:
                     st.success("Ottimo! Nessuna password riutilizzata trovata.")
                 else:
@@ -493,13 +554,6 @@ def main():
                     for pwd, services in reused_passwords.items():
                         st.warning(f"La password usata per **{', '.join(services)}** è la stessa.")
             with st.expander("😟 Password Deboli", expanded=True):
-                weak_passwords = []
-                for service, data in decrypted_passwords.items():
-                    pwd = data.get('password')
-                    if not pwd or "ERRORE" in pwd: continue
-                    strength = zxcvbn(pwd)
-                    if strength['score'] < 3:
-                        weak_passwords.append((service, strength['score']))
                 if not weak_passwords:
                     st.success("Perfetto! Tutte le tue password sono robuste.")
                 else:
@@ -507,14 +561,6 @@ def main():
                     for service, score in weak_passwords:
                         st.warning(f"La password per **{service}** ha un punteggio di robustezza basso ({score}/4).")
             with st.expander("🗓️ Password Anziane (più di 1 anno)", expanded=True):
-                old_passwords = []
-                one_year_ago = datetime.now() - timedelta(days=365)
-                for service, data in decrypted_passwords.items():
-                    last_updated_str = data.get('last_updated')
-                    if last_updated_str:
-                        last_updated_date = datetime.fromisoformat(last_updated_str)
-                        if last_updated_date < one_year_ago:
-                            old_passwords.append(service)
                 if not old_passwords:
                     st.success("Tutte le tue password sono state aggiornate di recente.")
                 else:
@@ -524,60 +570,74 @@ def main():
                         st.markdown(f"- **{service}**")
 
         elif scelta == "⚙️ Utility":
-            # ... (codice utility con cambio master password invariato) ...
             st.header("Utility Database")
-            st.subheader("📤 Esporta Database")
-            st.warning("Assicurati che il file importato sia stato criptato con la stessa Master Password.")
-            db_data = manager.load_encrypted_db()
-            if not db_data:
-                st.info("Nessun dato da esportare.")
-            else:
-                st.download_button("Scarica Backup Criptato (.json)", json.dumps(db_data, indent=4),
-                                   "password_backup.json", "application/json")
-            st.subheader("📥 Importa Database")
-            uploaded_file = st.file_uploader("Carica un file di backup (.json)", type="json")
-            if uploaded_file:
-                try:
-                    imported_data = json.load(uploaded_file)
-                    st.success(f"File '{uploaded_file.name}' caricato con {len(imported_data)} voci.")
-                    if st.button("Sostituisci Database con l'Importazione", type="primary"):
-                        manager.save_encrypted_db(imported_data)
-                        st.success("Database importato!")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Errore durante l'importazione: {e}")
-            st.markdown("---")
-            st.subheader("🔑 Cambia Master Password")
-            st.error("ATTENZIONE: Questa operazione è irreversibile. L'intero database verrà ri-criptato.")
-            with st.form("change_master_pwd_form"):
-                old_pwd = st.text_input("Vecchia Master Password", type="password",
-                                        help="Inserisci la password che stai usando ora.")
-                new_pwd = st.text_input("Nuova Master Password", type="password")
-                confirm_pwd = st.text_input("Conferma Nuova Master Password", type="password")
-                display_strength_bar(new_pwd)
-                submitted = st.form_submit_button("Cambia Master Password Ora", type="primary")
-                if submitted:
-                    if not old_pwd or not new_pwd or not confirm_pwd:
-                        st.error("Tutti i campi sono obbligatori.")
-                    elif new_pwd != confirm_pwd:
-                        st.error("Le nuove password non coincidono.")
-                    elif old_pwd != st.session_state.master_password_cache:
-                        st.error(
-                            "La 'Vecchia Master Password' inserita non corrisponde a quella della sessione corrente.")
-                    else:
-                        _, _, score, _ = get_password_strength_feedback(new_pwd)
-                        if score < 3:
-                            st.warning("La nuova password è troppo debole. Scegli una combinazione più robusta.")
+            tab_export, tab_import, tab_master = st.tabs(
+                ["📤 Esporta", "📥 Importa", "🔑 Cambia Master Password"])
+
+            with tab_export:
+                st.subheader("📤 Esporta Database")
+                st.caption("Il file scaricato contiene le tue credenziali ancora criptate.")
+                db_data = manager.load_encrypted_db()
+                if not db_data:
+                    st.info("Nessun dato da esportare.")
+                else:
+                    st.download_button("Scarica Backup Criptato (.json)", json.dumps(db_data, indent=4),
+                                       "password_backup.json", "application/json")
+
+            with tab_import:
+                st.subheader("📥 Importa Database")
+                st.warning("Assicurati che il file importato sia stato criptato con la stessa Master Password.")
+                uploaded_file = st.file_uploader("Carica un file di backup (.json)", type="json")
+                if uploaded_file:
+                    try:
+                        imported_data = json.load(uploaded_file)
+                        is_valid, validation_error = validate_imported_db(imported_data)
+                        if not is_valid:
+                            st.error(f"File di backup non valido: {validation_error}")
                         else:
-                            st.info("Sto cambiando la Master Password... Questo potrebbe richiedere un momento.")
-                            success, message = manager.change_master_password(old_pwd, new_pwd)
-                            if success:
-                                st.success(message)
-                                st.session_state.master_password_cache = new_pwd
-                                st.info("La sessione è stata aggiornata. Non è necessario un nuovo login.")
+                            st.success(f"File '{uploaded_file.name}' caricato con {len(imported_data)} voci.")
+                            confirm_import = st.checkbox(
+                                "Confermo di voler sostituire l'intero database attuale. L'operazione è irreversibile.")
+                            if st.button("Sostituisci Database con l'Importazione", type="primary",
+                                        disabled=not confirm_import):
+                                manager.save_encrypted_db(imported_data)
+                                st.success("Database importato!")
                                 st.rerun()
+                    except Exception as e:
+                        st.error(f"Errore durante l'importazione: {e}")
+
+            with tab_master:
+                st.subheader("🔑 Cambia Master Password")
+                st.error("ATTENZIONE: Questa operazione è irreversibile. L'intero database verrà ri-criptato.")
+                with st.form("change_master_pwd_form"):
+                    old_pwd = st.text_input("Vecchia Master Password", type="password",
+                                            help="Inserisci la password che stai usando ora.")
+                    new_pwd = st.text_input("Nuova Master Password", type="password")
+                    confirm_pwd = st.text_input("Conferma Nuova Master Password", type="password")
+                    display_strength_bar(new_pwd)
+                    submitted = st.form_submit_button("Cambia Master Password Ora", type="primary")
+                    if submitted:
+                        if not old_pwd or not new_pwd or not confirm_pwd:
+                            st.error("Tutti i campi sono obbligatori.")
+                        elif new_pwd != confirm_pwd:
+                            st.error("Le nuove password non coincidono.")
+                        elif old_pwd != st.session_state.master_password_cache:
+                            st.error(
+                                "La 'Vecchia Master Password' inserita non corrisponde a quella della sessione corrente.")
+                        else:
+                            _, _, score, _ = get_password_strength_feedback(new_pwd)
+                            if score < 3:
+                                st.warning("La nuova password è troppo debole. Scegli una combinazione più robusta.")
                             else:
-                                st.error(f"Errore: {message}")
+                                st.info("Sto cambiando la Master Password... Questo potrebbe richiedere un momento.")
+                                success, message = manager.change_master_password(old_pwd, new_pwd)
+                                if success:
+                                    st.success(message)
+                                    st.session_state.master_password_cache = new_pwd
+                                    st.info("La sessione è stata aggiornata. Non è necessario un nuovo login.")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Errore: {message}")
 
 
 if __name__ == "__main__":
