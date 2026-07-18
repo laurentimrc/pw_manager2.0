@@ -1,14 +1,21 @@
+import base64
+import hashlib
+import os
 from datetime import datetime
 
 import pyotp
 import pytest
+from cryptography.fernet import Fernet
 
 from password_manager import (
+    PBKDF2_ITERATIONS,
     PasswordManager,
     compute_security_flags,
     generate_random_password,
+    generate_recovery_code,
     generate_totp_code,
     get_password_strength_feedback,
+    normalize_recovery_code,
     sort_credentials,
     validate_imported_db,
 )
@@ -27,6 +34,24 @@ def unlock(manager, password="Correct-Horse-Battery-Staple-1"):
     salt = manager.generate_and_save_kdf_salt()
     manager.derive_and_set_cipher(password, salt)
     return password
+
+
+def unlock_with_recovery(manager, password="Correct-Horse-Battery-Staple-1"):
+    """Come `unlock`, ma restituisce anche il codice di recovery generato al
+    primo sblocco del vault (invece di scartarlo)."""
+    manager.set_master_hash(password)
+    salt = manager.generate_and_save_kdf_salt()
+    recovery_code = manager.derive_and_set_cipher(password, salt)
+    return password, recovery_code
+
+
+def legacy_kek(password: str, salt: bytes) -> bytes:
+    """Riproduce, indipendentemente dall'implementazione di PasswordManager,
+    la derivazione della KEK master usata per criptare i vault creati PRIMA
+    dell'introduzione della DEK: serve a costruire in questi test un vault
+    "legacy" plausibile su cui verificare la migrazione automatica."""
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, PBKDF2_ITERATIONS, dklen=32)
+    return base64.urlsafe_b64encode(key)
 
 
 class TestMasterPassword:
@@ -108,6 +133,220 @@ class TestChangeMasterPassword:
         unlock(manager)
         success, message = manager.change_master_password("WrongOldPassword", "NewMasterPassword456!")
         assert not success
+
+    def test_change_master_password_does_not_rotate_recovery_code(self, manager):
+        old_password, recovery_code = unlock_with_recovery(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+
+        success, _ = manager.change_master_password(old_password, "NewMasterPassword456!")
+        assert success
+
+        # Il cambio della sola master password non invalida il codice di
+        # recovery esistente: solo un utilizzo effettivo del recovery lo fa.
+        assert manager.verify_recovery_code(recovery_code)
+
+
+class TestRecoveryCodeGeneration:
+    def test_generate_recovery_code_has_expected_shape(self):
+        code = generate_recovery_code()
+        blocks = code.split("-")
+        assert len(blocks) == 5
+        assert all(len(block) == 4 for block in blocks)
+
+    def test_generate_recovery_code_excludes_ambiguous_characters(self):
+        for _ in range(20):
+            code = generate_recovery_code()
+            assert not any(c in "IO10" for c in code)
+
+    def test_generate_recovery_code_is_random(self):
+        codes = {generate_recovery_code() for _ in range(25)}
+        assert len(codes) == 25
+
+    def test_normalize_recovery_code_strips_dashes_and_uppercases(self):
+        assert normalize_recovery_code("abcd-efgh-ijkl-mnop-qrst") == "ABCDEFGHIJKLMNOPQRST"
+
+    def test_normalize_recovery_code_tolerates_spaces_and_mixed_case(self):
+        assert normalize_recovery_code(" AbCd efgh IJKL-mnop qrst ") == "ABCDEFGHIJKLMNOPQRST"
+
+    def test_normalize_empty_code_returns_empty_string(self):
+        assert normalize_recovery_code("") == ""
+
+
+class TestVaultKeyAndRecovery:
+    """Copre l'indirezione DEK/KEK: emissione del primo codice di recovery,
+    sblocco tramite codice, e reset della master password dimenticata."""
+
+    def test_first_unlock_generates_recovery_code_and_key_file(self, manager):
+        _, recovery_code = unlock_with_recovery(manager)
+        assert recovery_code
+        assert manager.cipher_suite is not None
+        assert os.path.exists(manager.key_file)
+
+    def test_second_unlock_does_not_regenerate_recovery_code(self, manager):
+        password, first_code = unlock_with_recovery(manager)
+        assert first_code
+
+        salt = manager.load_kdf_salt()
+        second_code = manager.derive_and_set_cipher(password, salt)
+        assert second_code is None
+
+    def test_data_added_after_first_unlock_is_readable_on_relogin(self, manager):
+        password, _ = unlock_with_recovery(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+
+        relogin_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        salt = relogin_manager.load_kdf_salt()
+        recovery_code = relogin_manager.derive_and_set_cipher(password, salt)
+        assert recovery_code is None  # nessuna nuova migrazione: già in formato DEK
+
+        decrypted = relogin_manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["password"] == "hunter2"
+
+    def test_verify_recovery_code_accepts_correct_code_regardless_of_formatting(self, manager):
+        _, recovery_code = unlock_with_recovery(manager)
+        assert manager.verify_recovery_code(recovery_code)
+        assert manager.verify_recovery_code(recovery_code.lower())
+        assert manager.verify_recovery_code(recovery_code.replace("-", " "))
+
+    def test_verify_recovery_code_rejects_wrong_code(self, manager):
+        unlock_with_recovery(manager)
+        assert not manager.verify_recovery_code("0000-0000-0000-0000-0000")
+
+    def test_verify_recovery_code_without_vault_returns_false(self, manager):
+        assert manager.verify_recovery_code("ANY-CODE-0000-0000-0000") is False
+
+    def test_recover_with_correct_code_unlocks_dek(self, manager):
+        _, recovery_code = unlock_with_recovery(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+
+        recovering_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        dek = recovering_manager.recover_with_code(recovery_code)
+        assert dek is not None
+
+        recovering_manager.cipher_suite = Fernet(dek)
+        decrypted = recovering_manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["password"] == "hunter2"
+
+    def test_recover_with_wrong_code_returns_none(self, manager):
+        unlock_with_recovery(manager)
+        recovering_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        assert recovering_manager.recover_with_code("0000-0000-0000-0000-0000") is None
+
+    def test_complete_recovery_sets_new_master_password_and_new_recovery_code(self, manager):
+        old_password, recovery_code = unlock_with_recovery(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+        new_password = "Brand-New-Master-Pass-99!"
+
+        recovering_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        dek = recovering_manager.recover_with_code(recovery_code)
+        assert dek is not None
+        new_recovery_code = recovering_manager.complete_recovery(dek, new_password)
+
+        assert new_recovery_code
+        assert new_recovery_code != recovery_code
+        assert recovering_manager.verify_master_password(new_password)
+        assert not recovering_manager.verify_master_password(old_password)
+
+        # Le credenziali salvate prima del recovery restano leggibili con la
+        # nuova master password, tramite un login "normale" successivo.
+        login_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        salt = login_manager.load_kdf_salt()
+        migration_code = login_manager.derive_and_set_cipher(new_password, salt)
+        assert migration_code is None
+        decrypted = login_manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["password"] == "hunter2"
+
+    def test_old_recovery_code_is_invalidated_after_use(self, manager):
+        _, recovery_code = unlock_with_recovery(manager)
+
+        recovering_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        dek = recovering_manager.recover_with_code(recovery_code)
+        recovering_manager.complete_recovery(dek, "Another-New-Master-Pass-2!")
+
+        assert not recovering_manager.verify_recovery_code(recovery_code)
+        assert recovering_manager.recover_with_code(recovery_code) is None
+
+
+class TestLegacyVaultMigration:
+    """Un vault creato PRIMA di questa funzionalità non ha `key_file`: i dati
+    sono ancora criptati direttamente con la KEK master. La migrazione deve
+    avvenire in modo trasparente al primo sblocco riuscito successivo."""
+
+    def test_migrates_legacy_vault_on_first_unlock(self, manager):
+        password = "Correct-Horse-Battery-Staple-1"
+        manager.set_master_hash(password)
+        salt = manager.generate_and_save_kdf_salt()
+
+        old_cipher = Fernet(legacy_kek(password, salt))
+        manager.save_encrypted_db({
+            "GitHub": {
+                "username": "octocat@example.com",
+                "password_criptata": old_cipher.encrypt(b"hunter2").decode(),
+                "totp_secret_criptato": "",
+                "last_updated": "2024-01-01T00:00:00",
+            }
+        })
+        assert not os.path.exists(manager.key_file)
+
+        recovery_code = manager.derive_and_set_cipher(password, salt)
+
+        assert recovery_code
+        assert os.path.exists(manager.key_file)
+        decrypted = manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["password"] == "hunter2"
+        assert decrypted["GitHub"]["username"] == "octocat@example.com"
+        assert decrypted["GitHub"]["last_updated"] == "2024-01-01T00:00:00"
+
+    def test_migrates_legacy_vault_with_totp_secret(self, manager):
+        password = "Correct-Horse-Battery-Staple-1"
+        manager.set_master_hash(password)
+        salt = manager.generate_and_save_kdf_salt()
+
+        old_cipher = Fernet(legacy_kek(password, salt))
+        secret = pyotp.random_base32()
+        manager.save_encrypted_db({
+            "GitHub": {
+                "username": "octocat@example.com",
+                "password_criptata": old_cipher.encrypt(b"hunter2").decode(),
+                "totp_secret_criptato": old_cipher.encrypt(secret.encode()).decode(),
+                "last_updated": None,
+            }
+        })
+
+        manager.derive_and_set_cipher(password, salt)
+        decrypted = manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["totp_secret"] == secret
+
+    def test_migration_is_idempotent_on_subsequent_unlocks(self, manager):
+        password = "Correct-Horse-Battery-Staple-1"
+        manager.set_master_hash(password)
+        salt = manager.generate_and_save_kdf_salt()
+
+        old_cipher = Fernet(legacy_kek(password, salt))
+        manager.save_encrypted_db({
+            "GitHub": {
+                "username": "a",
+                "password_criptata": old_cipher.encrypt(b"hunter2").decode(),
+                "totp_secret_criptato": "",
+                "last_updated": None,
+            }
+        })
+
+        first_code = manager.derive_and_set_cipher(password, salt)
+        second_code = manager.derive_and_set_cipher(password, salt)
+        assert first_code is not None
+        assert second_code is None
+
+    def test_migrates_legacy_vault_with_no_existing_credentials(self, manager):
+        # Vault legacy "vuoto": master password e salt già impostati, ma
+        # nessuna credenziale salvata ancora (nessun passwords.json).
+        password = "Correct-Horse-Battery-Staple-1"
+        manager.set_master_hash(password)
+        salt = manager.generate_and_save_kdf_salt()
+
+        recovery_code = manager.derive_and_set_cipher(password, salt)
+        assert recovery_code
+        assert manager.get_decrypted_passwords() == {}
 
 
 class TestPasswordGenerator:

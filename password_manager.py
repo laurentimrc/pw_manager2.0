@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import random
+import secrets
 import string
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,17 +17,53 @@ PBKDF2_ITERATIONS = 600000
 SYMBOLS = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 AMBIGUOUS_CHARACTERS = "Il1O0|'`"
 
+# Alfabeto ristretto (maiuscole + cifre, senza caratteri ambigui) usato per i
+# codici di recovery: pensati per essere trascritti a mano, non digitati a
+# macchina come una password normale.
+RECOVERY_CODE_ALPHABET = "".join(
+    c for c in string.ascii_uppercase + string.digits if c not in AMBIGUOUS_CHARACTERS
+)
+RECOVERY_CODE_BLOCK_COUNT = 5
+RECOVERY_CODE_BLOCK_LENGTH = 4
+KEY_MATERIAL_VERSION = 2
+
 
 class PasswordManager:
     """
     Incapsula tutta la logica di gestione delle password.
+
+    Modello delle chiavi (dalla v2 del formato dati):
+    - Una Data Encryption Key (DEK) casuale cripta/decripta `passwords.json`.
+      Non è mai derivata dalla master password: è generata con
+      `Fernet.generate_key()` al primo sblocco riuscito del vault.
+    - La DEK viene "avvolta" (wrapped, cioè criptata con Fernet) da due Key
+      Encryption Key (KEK) indipendenti, entrambe derivate via PBKDF2 (stesso
+      schema/iterazioni usati per la master password) ma da segreti e salt
+      diversi:
+        * la KEK "master", da master password + `kdf.salt` (invariato);
+        * la KEK "recovery", da un codice di recovery ad alta entropia +
+          un salt separato.
+      Entrambe le versioni avvolte della DEK, il salt di recovery e l'hash
+      bcrypt del codice di recovery vivono in `key_file` (default
+      `vault_key.json` accanto a `db_file`). Il codice di recovery in chiaro
+      non viene mai salvato su disco: è mostrato una sola volta al momento
+      della generazione.
+    - I vault creati prima di questa funzionalità (nessun `key_file`, dati
+      criptati direttamente con la KEK master) vengono migrati
+      automaticamente al primo sblocco riuscito: vedi `derive_and_set_cipher`.
     """
 
-    def __init__(self, hash_file: str, salt_file: str, db_file: str):
+    def __init__(self, hash_file: str, salt_file: str, db_file: str, key_file: Optional[str] = None):
         self.hash_file = hash_file
         self.salt_file = salt_file
         self.db_file = db_file
+        self.key_file = key_file or self._default_key_file(db_file)
         self.cipher_suite: Optional[Fernet] = None
+
+    @staticmethod
+    def _default_key_file(db_file: str) -> str:
+        directory = os.path.dirname(db_file)
+        return os.path.join(directory, "vault_key.json") if directory else "vault_key.json"
 
     # --- Master password ---
     def master_hash_exists(self) -> bool:
@@ -65,10 +102,155 @@ class PasswordManager:
             f.write(salt)
         return salt
 
-    def derive_and_set_cipher(self, master_password: str, salt: bytes) -> None:
-        key = hashlib.pbkdf2_hmac('sha256', master_password.encode('utf-8'), salt, PBKDF2_ITERATIONS, dklen=32)
-        fernet_key = base64.urlsafe_b64encode(key)
-        self.cipher_suite = Fernet(fernet_key)
+    def _derive_kek(self, secret: str, salt: bytes) -> bytes:
+        """Deriva una Key Encryption Key Fernet da un segreto (master password
+        o codice di recovery normalizzato) e un salt, con lo stesso schema
+        PBKDF2-HMAC-SHA256 usato ovunque nel modulo."""
+        key = hashlib.pbkdf2_hmac('sha256', secret.encode('utf-8'), salt, PBKDF2_ITERATIONS, dklen=32)
+        return base64.urlsafe_b64encode(key)
+
+    # --- Materiale crittografico del vault (DEK avvolta da due KEK) ---
+    def _load_key_material(self) -> Optional[Dict[str, Any]]:
+        if not os.path.exists(self.key_file):
+            return None
+        try:
+            with open(self.key_file, "r") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _save_key_material(self, key_material: Dict[str, Any]) -> None:
+        with open(self.key_file, "w") as f:
+            json.dump(key_material, f, indent=4)
+
+    def _build_key_material(self, dek: bytes, master_kek: bytes) -> Tuple[Dict[str, Any], str]:
+        """Costruisce il materiale crittografico completo per una DEK: la
+        avvolge con la KEK master fornita e genera/avvolge un NUOVO codice di
+        recovery. Non scrive nulla su disco (vedi `_save_key_material`);
+        restituisce il materiale e il codice di recovery in chiaro, da
+        mostrare una sola volta al chiamante."""
+        recovery_code = generate_recovery_code()
+        normalized_code = normalize_recovery_code(recovery_code)
+        recovery_salt = os.urandom(16)
+        recovery_kek = self._derive_kek(normalized_code, recovery_salt)
+
+        key_material = {
+            "version": KEY_MATERIAL_VERSION,
+            "dek_wrapped_by_master": Fernet(master_kek).encrypt(dek).decode(),
+            "recovery": {
+                "salt": base64.b64encode(recovery_salt).decode(),
+                "dek_wrapped_by_recovery": Fernet(recovery_kek).encrypt(dek).decode(),
+                "code_hash": bcrypt.hashpw(normalized_code.encode('utf-8'), bcrypt.gensalt()).decode(),
+            },
+        }
+        return key_material, recovery_code
+
+    def derive_and_set_cipher(self, master_password: str, salt: bytes) -> Optional[str]:
+        """Sblocca il vault con la master password: deriva la KEK master e la
+        usa per svelare la DEK che cripta/decripta `passwords.json`.
+
+        Se il vault non ha ancora materiale DEK salvato (`key_file`
+        mancante), questo è il primo sblocco riuscito di questo vault: può
+        trattarsi di un vault appena creato (database vuoto) oppure di un
+        vault "legacy", creato prima di questa funzionalità, in cui i dati
+        sono ancora criptati direttamente con la KEK master. In entrambi i
+        casi viene generata ora una DEK, i dati esistenti (se presenti)
+        vengono spostati sotto di essa, e viene emesso il primo codice di
+        recovery.
+
+        Restituisce il codice di recovery in chiaro SOLO quando è stato
+        appena generato in questa chiamata (prima inizializzazione o
+        migrazione); altrimenti None (sblocco "normale").
+        """
+        master_kek = self._derive_kek(master_password, salt)
+        key_material = self._load_key_material()
+
+        if key_material is not None:
+            dek = Fernet(master_kek).decrypt(key_material["dek_wrapped_by_master"].encode())
+            self.cipher_suite = Fernet(dek)
+            return None
+
+        legacy_db = self.load_encrypted_db()
+        dek = Fernet.generate_key()
+        dek_cipher = Fernet(dek)
+
+        if legacy_db:
+            legacy_cipher = Fernet(master_kek)
+            migrated_db = {}
+            for service, credentials in legacy_db.items():
+                password_plain = legacy_cipher.decrypt(credentials['password_criptata'].encode()).decode()
+
+                totp_encrypted = credentials.get("totp_secret_criptato") or ""
+                totp_plain = legacy_cipher.decrypt(totp_encrypted.encode()).decode() if totp_encrypted else ""
+
+                migrated_db[service] = {
+                    "username": credentials['username'],
+                    "password_criptata": dek_cipher.encrypt(password_plain.encode()).decode(),
+                    "totp_secret_criptato": dek_cipher.encrypt(totp_plain.encode()).decode() if totp_plain else "",
+                    "last_updated": credentials.get("last_updated"),
+                }
+            self.save_encrypted_db(migrated_db)
+
+        new_key_material, recovery_code = self._build_key_material(dek, master_kek)
+        self._save_key_material(new_key_material)
+        self.cipher_suite = dek_cipher
+        return recovery_code
+
+    # --- Recovery della Master Password ---
+    def verify_recovery_code(self, code: str) -> bool:
+        """Verifica un codice di recovery contro l'hash bcrypt salvato, senza
+        tentare di sbloccare la DEK: usato per dare un errore "codice errato"
+        immediato e leggibile, prima ancora di chiedere una nuova master
+        password."""
+        key_material = self._load_key_material()
+        if not key_material:
+            return False
+        recovery = key_material.get("recovery") or {}
+        code_hash = recovery.get("code_hash")
+        normalized = normalize_recovery_code(code or "")
+        if not code_hash or not normalized:
+            return False
+        try:
+            return bcrypt.checkpw(normalized.encode('utf-8'), code_hash.encode('utf-8'))
+        except ValueError:
+            return False
+
+    def recover_with_code(self, code: str) -> Optional[bytes]:
+        """Se il codice di recovery è corretto, sblocca e restituisce la DEK
+        in chiaro (bytes, formato chiave Fernet), senza impostare
+        `self.cipher_suite`: l'unico modo legittimo di ripristinare l'accesso
+        è chiamare subito dopo `complete_recovery` con una nuova master
+        password. Restituisce None se il codice è errato o il vault non ha
+        materiale di recovery."""
+        if not self.verify_recovery_code(code):
+            return None
+        key_material = self._load_key_material() or {}
+        recovery = key_material.get("recovery") or {}
+        try:
+            recovery_salt = base64.b64decode(recovery["salt"])
+            recovery_kek = self._derive_kek(normalize_recovery_code(code), recovery_salt)
+            return Fernet(recovery_kek).decrypt(recovery["dek_wrapped_by_recovery"].encode())
+        except Exception:
+            return None
+
+    def complete_recovery(self, dek: bytes, new_password: str) -> str:
+        """Da chiamare subito dopo un `recover_with_code` andato a buon fine:
+        imposta la nuova master password (l'utente l'ha dimenticata, quindi
+        DEVE sceglierne una nuova), ri-avvolge la DEK esistente con la nuova
+        KEK master (i dati restano quelli di sempre, nessuna ri-crittografia
+        delle singole credenziali) e genera un NUOVO codice di recovery: il
+        codice appena usato è a uso singolo e da questo momento non è più
+        valido, perché il file di materiale crittografico viene interamente
+        sovrascritto. Restituisce il nuovo codice in chiaro, da mostrare una
+        sola volta."""
+        self.set_master_hash(new_password)
+        new_salt = self.generate_and_save_kdf_salt()
+        new_master_kek = self._derive_kek(new_password, new_salt)
+
+        key_material, new_recovery_code = self._build_key_material(dek, new_master_kek)
+        self._save_key_material(key_material)
+        self.cipher_suite = Fernet(dek)
+        return new_recovery_code
 
     # --- Gestione Database ---
     def load_encrypted_db(self) -> Dict[str, Any]:
@@ -137,6 +319,12 @@ class PasswordManager:
             self.save_encrypted_db(db)
 
     def change_master_password(self, old_password: str, new_password: str) -> Tuple[bool, str]:
+        """Cambia la master password. Grazie all'indirezione DEK/KEK, questa
+        operazione NON deve più decriptare e ri-criptare ogni singola
+        credenziale: si limita a ri-avvolgere la DEK esistente (invariata)
+        con una nuova KEK master. Il comportamento osservabile resta
+        identico a prima: dopo il cambio, tutte le credenziali restano
+        leggibili con la nuova master password."""
         if not self.verify_master_password(old_password):
             return False, "La vecchia Master Password è errata."
 
@@ -144,58 +332,57 @@ class PasswordManager:
         if not old_salt:
             return False, "File salt KDF non trovato. Annullamento."
 
-        old_key = hashlib.pbkdf2_hmac('sha256', old_password.encode('utf-8'), old_salt, PBKDF2_ITERATIONS, dklen=32)
-        old_fernet_key = base64.urlsafe_b64encode(old_key)
-        old_cipher = Fernet(old_fernet_key)
+        # Garantisce che il vault sia già nel formato con DEK: nessun effetto
+        # se lo è già (è lo stesso percorso di migrazione automatica eseguito
+        # ad ogni login riuscito), altrimenti migra ora un vault legacy.
+        try:
+            self.derive_and_set_cipher(old_password, old_salt)
+        except Exception:
+            return False, "Impossibile leggere i dati esistenti con la vecchia Master Password. Annullamento."
 
-        encrypted_db = self.load_encrypted_db()
-        decrypted_data_map = {}
+        key_material = self._load_key_material()
+        if key_material is None:
+            return False, "Materiale crittografico del vault non trovato. Annullamento."
 
-        for service, credentials in encrypted_db.items():
-            try:
-                decrypted_password = old_cipher.decrypt(credentials['password_criptata'].encode()).decode()
-
-                decrypted_totp = ""
-                if credentials.get("totp_secret_criptato"):
-                    decrypted_totp = old_cipher.decrypt(credentials['totp_secret_criptato'].encode()).decode()
-
-                decrypted_data_map[service] = {
-                    "username": credentials['username'],
-                    "password": decrypted_password,
-                    "totp_secret": decrypted_totp,
-                    "last_updated": credentials.get("last_updated"),
-                }
-            except Exception:
-                return False, f"Errore di decriptazione per '{service}'. Annullamento."
+        old_master_kek = self._derive_kek(old_password, old_salt)
+        try:
+            dek = Fernet(old_master_kek).decrypt(key_material["dek_wrapped_by_master"].encode())
+        except Exception:
+            return False, "Impossibile decriptare la chiave del vault con la vecchia Master Password."
 
         self.set_master_hash(new_password)
         new_salt = self.generate_and_save_kdf_salt()
-        new_key = hashlib.pbkdf2_hmac('sha256', new_password.encode('utf-8'), new_salt, PBKDF2_ITERATIONS, dklen=32)
-        new_fernet_key = base64.urlsafe_b64encode(new_key)
-        new_cipher = Fernet(new_fernet_key)
+        new_master_kek = self._derive_kek(new_password, new_salt)
+        key_material["dek_wrapped_by_master"] = Fernet(new_master_kek).encrypt(dek).decode()
+        self._save_key_material(key_material)
 
-        new_encrypted_db = {}
-        for service, data in decrypted_data_map.items():
-            try:
-                encrypted_password = new_cipher.encrypt(data['password'].encode()).decode()
-
-                encrypted_totp = ""
-                if data.get("totp_secret"):
-                    encrypted_totp = new_cipher.encrypt(data['totp_secret'].encode()).decode()
-
-                new_encrypted_db[service] = {
-                    "username": data['username'],
-                    "password_criptata": encrypted_password,
-                    "totp_secret_criptato": encrypted_totp,
-                    "last_updated": data.get("last_updated") or datetime.now().isoformat(),
-                }
-            except Exception as e:
-                return False, f"Errore durante la ri-crittografia per '{service}': {e}"
-
-        self.save_encrypted_db(new_encrypted_db)
-        self.cipher_suite = new_cipher
+        self.cipher_suite = Fernet(dek)
 
         return True, "Master Password cambiata con successo!"
+
+
+def generate_recovery_code() -> str:
+    """Genera un codice di recovery casuale ad alta entropia (CSPRNG via
+    `secrets`), in blocchi leggibili tipo 'XXXX-XXXX-XXXX-XXXX-XXXX' per
+    facilitarne la trascrizione a mano. Alfabeto ristretto a maiuscole e
+    cifre, senza caratteri ambigui (stesso criterio di `AMBIGUOUS_CHARACTERS`
+    usato dal generatore di password)."""
+    blocks = [
+        "".join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(RECOVERY_CODE_BLOCK_LENGTH))
+        for _ in range(RECOVERY_CODE_BLOCK_COUNT)
+    ]
+    return "-".join(blocks)
+
+
+def normalize_recovery_code(code: str) -> str:
+    """Canonicalizza un codice di recovery inserito dall'utente prima di
+    derivarne la KEK o confrontarlo con l'hash salvato: rimuove trattini e
+    spazi, converte in maiuscolo. Tollera formattazioni leggermente diverse
+    da quella mostrata al momento della generazione (es. copia/incolla con
+    spazi al posto dei trattini, minuscolo)."""
+    if not code:
+        return ""
+    return "".join(ch for ch in code.strip().upper() if ch != "-" and not ch.isspace())
 
 
 def get_password_strength_feedback(password: str) -> Tuple[str, str, int, str]:

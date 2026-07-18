@@ -2,6 +2,7 @@
 passwords.json
 master_pwd.hash
 kdf.salt
+vault_key.json
 password_backup.json
 
 # Python

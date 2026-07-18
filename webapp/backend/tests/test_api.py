@@ -43,6 +43,24 @@ class TestAuthSetupAndLogin:
         assert status["authenticated"] is True
         assert "pwm_session" in client.cookies
 
+    def test_setup_returns_recovery_code_once(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.post("/api/auth/setup", json={
+            "new_password": MASTER_PASSWORD, "confirm_password": MASTER_PASSWORD,
+        })
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["recovery_code"]
+        assert len(body["recovery_code"].split("-")) == 5
+
+    def test_login_after_setup_does_not_return_a_new_recovery_code(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.cookies.clear()
+        resp = client.post("/api/auth/login", json={"password": MASTER_PASSWORD})
+        assert resp.status_code == 200
+        assert resp.json()["recovery_code"] is None
+
     def test_setup_rejects_short_password(self, tmp_path):
         client = make_client(tmp_path)
         resp = client.post("/api/auth/setup", json={"new_password": "short", "confirm_password": "short"})
@@ -305,6 +323,92 @@ class TestUtility:
             "confirm_password": "Another-Strong-Master-Pass-2!",
         })
         assert resp.status_code == 400
+
+
+class TestRecovery:
+    def _setup_and_get_recovery_code(self, tmp_path) -> tuple:
+        client = make_client(tmp_path)
+        resp = client.post("/api/auth/setup", json={
+            "new_password": MASTER_PASSWORD, "confirm_password": MASTER_PASSWORD,
+        })
+        recovery_code = resp.json()["recovery_code"]
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "octocat@example.com", "password": "hunter2-Strong!",
+        })
+        return client, recovery_code
+
+    def test_recover_requires_existing_vault(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": "AAAA-AAAA-AAAA-AAAA-AAAA"})
+        assert resp.status_code == 409
+
+    def test_verify_correct_recovery_code_succeeds(self, tmp_path):
+        client, recovery_code = self._setup_and_get_recovery_code(tmp_path)
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": recovery_code})
+        assert resp.status_code == 200
+        assert resp.json()["valid"] is True
+
+    def test_verify_wrong_recovery_code_gives_clear_error(self, tmp_path):
+        client, _ = self._setup_and_get_recovery_code(tmp_path)
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": "0000-0000-0000-0000-0000"})
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "invalid_recovery_code"
+
+    def test_recover_with_wrong_code_fails_without_crashing(self, tmp_path):
+        client, _ = self._setup_and_get_recovery_code(tmp_path)
+        resp = client.post("/api/auth/recover", json={
+            "recovery_code": "0000-0000-0000-0000-0000",
+            "new_password": "Brand-New-Master-Pass-99!",
+            "confirm_password": "Brand-New-Master-Pass-99!",
+        })
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "invalid_recovery_code"
+
+    def test_recover_with_weak_new_password_is_rejected(self, tmp_path):
+        client, recovery_code = self._setup_and_get_recovery_code(tmp_path)
+        resp = client.post("/api/auth/recover", json={
+            "recovery_code": recovery_code, "new_password": "short", "confirm_password": "short",
+        })
+        assert resp.status_code == 400
+
+    def test_recover_with_mismatched_confirmation_is_rejected(self, tmp_path):
+        client, recovery_code = self._setup_and_get_recovery_code(tmp_path)
+        resp = client.post("/api/auth/recover", json={
+            "recovery_code": recovery_code,
+            "new_password": "Brand-New-Master-Pass-99!",
+            "confirm_password": "Different-Pass-2!",
+        })
+        assert resp.status_code == 400
+
+    def test_full_recovery_flow_resets_password_and_keeps_data_readable(self, tmp_path):
+        client, recovery_code = self._setup_and_get_recovery_code(tmp_path)
+        new_password = "Brand-New-Master-Pass-99!"
+
+        resp = client.post("/api/auth/recover", json={
+            "recovery_code": recovery_code, "new_password": new_password, "confirm_password": new_password,
+        })
+        assert resp.status_code == 200
+        new_recovery_code = resp.json()["recovery_code"]
+        assert new_recovery_code
+        assert new_recovery_code != recovery_code
+
+        # Il vecchio codice di recovery non è più valido (uso singolo).
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": recovery_code})
+        assert resp.status_code == 400
+
+        # La vecchia Master Password non funziona più, la nuova sì, e i dati
+        # inseriti prima del recovery sono ancora leggibili.
+        client.cookies.clear()
+        resp = client.post("/api/auth/login", json={"password": MASTER_PASSWORD})
+        assert resp.status_code == 401
+        resp = client.post("/api/auth/login", json={"password": new_password})
+        assert resp.status_code == 200
+        assert resp.json()["recovery_code"] is None
+
+        secret = client.get("/api/credentials/GitHub/secret")
+        assert secret.status_code == 200
+        assert secret.json()["password"] == "hunter2-Strong!"
 
 
 class TestPasswordHelpers:

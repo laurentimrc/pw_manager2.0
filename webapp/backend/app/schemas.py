@@ -18,6 +18,16 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RecoverVerifyRequest(BaseModel):
+    recovery_code: str
+
+
+class RecoverCompleteRequest(BaseModel):
+    recovery_code: str
+    new_password: str
+    confirm_password: str
+
+
 class AddCredentialRequest(BaseModel):
     service: str
     username: str

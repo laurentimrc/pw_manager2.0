@@ -42,6 +42,8 @@ from .schemas import (
     LoginRequest,
     PasswordGeneratorRequest,
     PasswordStrengthRequest,
+    RecoverCompleteRequest,
+    RecoverVerifyRequest,
     SetupRequest,
     UpdateCredentialRequest,
 )
@@ -69,7 +71,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     # --- Helpers interni ---
     def get_manager() -> PasswordManager:
-        return PasswordManager(settings.hash_file, settings.salt_file, settings.db_file)
+        return PasswordManager(settings.hash_file, settings.salt_file, settings.db_file, settings.key_file)
 
     def manager_for_session(session: SessionData) -> PasswordManager:
         manager = get_manager()
@@ -144,12 +146,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         manager.set_master_hash(payload.new_password)
         salt = manager.generate_and_save_kdf_salt()
-        manager.derive_and_set_cipher(payload.new_password, salt)
+        # Al primo sblocco di un vault appena creato, `derive_and_set_cipher`
+        # minta la DEK e restituisce il primo codice di recovery: va mostrato
+        # una sola volta all'utente subito dopo il setup (vedi frontend).
+        recovery_code = manager.derive_and_set_cipher(payload.new_password, salt)
 
         session_id = sessions.create(payload.new_password, manager.cipher_suite)
         login_guard.reset()
         set_session_cookie(response, session_id)
-        return {"authenticated": True}
+        return {"authenticated": True, "recovery_code": recovery_code}
 
     @app.post("/api/auth/login")
     def login(payload: LoginRequest, response: Response):
@@ -187,11 +192,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         salt = manager.load_kdf_salt()
         if not salt:
             raise HTTPException(status_code=500, detail="File salt KDF non trovato.")
-        manager.derive_and_set_cipher(payload.password, salt)
+        # Non-None solo per un vault "legacy" (creato prima dell'introduzione
+        # della DEK) che viene migrato automaticamente proprio in questo
+        # login: in quel caso, come al setup, il nuovo codice di recovery va
+        # mostrato una volta sola all'utente.
+        recovery_code = manager.derive_and_set_cipher(payload.password, salt)
 
         session_id = sessions.create(payload.password, manager.cipher_suite)
         set_session_cookie(response, session_id)
-        return {"authenticated": True}
+        return {"authenticated": True, "recovery_code": recovery_code}
 
     @app.post("/api/auth/logout")
     def logout(request: Request, response: Response):
@@ -199,6 +208,52 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         sessions.destroy(session_id)
         clear_session_cookie(response)
         return {"authenticated": False}
+
+    # --- Recovery della Master Password dimenticata ---
+    # Flusso in due chiamate, pensato per la UI "Hai dimenticato la Master
+    # Password?": prima si verifica il codice da solo (per un errore chiaro
+    # e immediato senza dover anche compilare la nuova password), poi si
+    # invia codice + nuova Master Password insieme per completare il
+    # recovery. Nessuna sessione viene creata qui: dopo il reset l'utente
+    # effettua un login normale con la nuova Master Password, esattamente
+    # come dopo un cambio Master Password "volontario".
+    @app.post("/api/auth/recover/verify")
+    def recover_verify(payload: RecoverVerifyRequest):
+        manager = get_manager()
+        if not manager.master_hash_exists():
+            raise HTTPException(status_code=409, detail="Nessun vault esistente da recuperare.")
+        if not manager.verify_recovery_code(payload.recovery_code):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_recovery_code", "message": "Codice di recovery non valido."},
+            )
+        return {"valid": True}
+
+    @app.post("/api/auth/recover")
+    def recover_complete(payload: RecoverCompleteRequest):
+        manager = get_manager()
+        if not manager.master_hash_exists():
+            raise HTTPException(status_code=409, detail="Nessun vault esistente da recuperare.")
+        if not payload.recovery_code or not payload.new_password or not payload.confirm_password:
+            raise HTTPException(status_code=400, detail="Tutti i campi sono obbligatori.")
+        if payload.new_password != payload.confirm_password:
+            raise HTTPException(status_code=400, detail="Le nuove password non coincidono.")
+        if len(payload.new_password) < 12:
+            raise HTTPException(status_code=400, detail="La Master Password deve essere di almeno 12 caratteri.")
+        _, _, score, _ = get_password_strength_feedback(payload.new_password)
+        if score < 3:
+            raise HTTPException(status_code=400,
+                                detail="La nuova password è troppo debole. Scegli una combinazione più robusta.")
+
+        dek = manager.recover_with_code(payload.recovery_code)
+        if dek is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_recovery_code", "message": "Codice di recovery non valido."},
+            )
+
+        new_recovery_code = manager.complete_recovery(dek, payload.new_password)
+        return {"recovery_code": new_recovery_code}
 
     # --- Password strength / generator (utilizzabili anche prima del login, es. setup) ---
     @app.post("/api/password-strength")

@@ -7,6 +7,19 @@ export interface AuthStatus {
   session_timeout_seconds: number
 }
 
+/** Risposta di setup/login: `recovery_code` è presente (una tantum) solo
+ * quando in questa chiamata è stato appena generato un nuovo codice di
+ * recovery — al setup iniziale, oppure alla migrazione automatica di un
+ * vault "legacy" al primo login riuscito. */
+export interface AuthResult {
+  authenticated: boolean
+  recovery_code?: string | null
+}
+
+export interface RecoverCompleteResult {
+  recovery_code: string
+}
+
 export interface CredentialListItem {
   service: string
   username: string

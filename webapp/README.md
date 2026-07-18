@@ -1,6 +1,6 @@
 # Password Manager Pro — Webapp (React + FastAPI)
 
-Interfaccia alternativa, con look moderno, all'app Streamlit esistente (`ps_manager_app.py`, alla radice del repository). Le due interfacce sono equivalenti dal punto di vista funzionale e condividono lo stesso vault locale (`passwords.json`, `master_pwd.hash`, `kdf.salt` nella radice del repo) tramite lo stesso modulo `password_manager.py`, che non viene duplicato né riscritto.
+Interfaccia alternativa, con look moderno, all'app Streamlit esistente (`ps_manager_app.py`, alla radice del repository). Le due interfacce condividono lo stesso vault locale (`passwords.json`, `master_pwd.hash`, `kdf.salt`, `vault_key.json` nella radice del repo) tramite lo stesso modulo `password_manager.py`, che non viene duplicato né riscritto. Sono equivalenti per setup/login/credenziali/cambio master password; il **recovery della master password dimenticata** ha una UI dedicata SOLO qui (vedi sotto) — Streamlit continua a funzionare invariato attraverso la stessa logica di dominio, ma senza un modo per avviare il recovery da quell'interfaccia.
 
 ⚠️ Stesso disclaimer del progetto principale: applicazione didattica, non pensata per credenziali reali/critiche senza una revisione di sicurezza approfondita.
 
@@ -22,7 +22,7 @@ webapp/
         ├── App.tsx                    orchestrazione setup/login/app autenticata
         ├── AuthenticatedApp.tsx       shell con sidebar + routing tra le viste
         ├── lib/api.ts                 client HTTP verso il backend (fetch, credentials: 'include')
-        ├── components/auth/           Setup e Login
+        ├── components/auth/           Setup, Login, reveal codice di recovery, flusso "password dimenticata"
         ├── components/credentials/    lista, form aggiunta/modifica, generatore, TOTP, copia rapida
         ├── components/dashboard/      Dashboard di Sicurezza
         ├── components/utility/        Export / Import / Cambio Master Password
@@ -43,6 +43,17 @@ Streamlit non separa lato server/client in modo esplicito (tutto il rendering è
 - CORS ristretto alla sola origine del dev server Vite (default `http://127.0.0.1:5173`), non wildcard.
 - Import/validazione backup riusa `validate_imported_db`; lista/badge di sicurezza riusano `compute_security_flags`/`sort_credentials`; nessuna logica di dominio duplicata nel backend.
 
+### Recovery della Master Password dimenticata (solo webapp)
+
+Tutta la logica vive in `password_manager.py` (condivisa con Streamlit), il backend si limita a esporla via HTTP:
+
+- Le credenziali sono criptate con una **DEK** (Data Encryption Key) casuale, non derivata dalla master password. La DEK è "avvolta" (wrapped, criptata con Fernet) da due KEK indipendenti: una dalla master password + `kdf.salt` (come prima), una da un **codice di recovery** ad alta entropia (~100 bit, formato leggibile `XXXX-XXXX-XXXX-XXXX-XXXX`) + un salt separato. Tutto questo materiale vive in `vault_key.json`; il codice di recovery in chiaro non è mai salvato su disco.
+- Al setup (`POST /api/auth/setup`) e, per i vault creati prima di questa funzionalità, al primo login riuscito successivo (`POST /api/auth/login`, migrazione automatica e trasparente), la risposta include un campo `recovery_code` **una tantum**: il frontend lo mostra in una schermata dedicata con conferma esplicita ("ho salvato il codice") prima di proseguire, come i backup code 2FA.
+- Flusso "Hai dimenticato la Master Password?" (dalla schermata di login):
+  1. `POST /api/auth/recover/verify` — verifica il codice contro l'hash bcrypt salvato, senza toccare la DEK: dà un errore chiaro e immediato ("codice non valido") prima ancora di far scegliere una nuova master password.
+  2. `POST /api/auth/recover` — codice + nuova master password: sblocca la DEK con la KEK di recovery, ri-avvolge la DEK con la nuova KEK master, e genera/salva un **nuovo** codice di recovery (quello usato è a uso singolo e da questo momento non è più valido). Nessuna sessione viene creata da questa chiamata: l'utente torna alla schermata di login e accede con la nuova master password.
+- `change_master_password` non ri-cripta più ogni singola credenziale: si limita a ri-avvolgere la DEK esistente con la nuova KEK master (la DEK stessa non cambia). Il codice di recovery non viene ruotato da un cambio "volontario" della master password, solo da un uso effettivo del recovery.
+
 ## Avvio in sviluppo
 
 ### Backend (porta 8000, solo 127.0.0.1)
@@ -53,7 +64,7 @@ pip install -r requirements.txt   # + requirements.txt della radice del repo (bc
 python -m uvicorn app.main:app --app-dir . --host 127.0.0.1 --port 8000
 ```
 
-Il backend usa di default `passwords.json`, `master_pwd.hash`, `kdf.salt` nella **radice del repository** (stesso vault dell'app Streamlit). Per puntare altrove (es. nei test), sovrascrivi con le variabili d'ambiente `PWM_HASH_FILE`, `PWM_SALT_FILE`, `PWM_DB_FILE`.
+Il backend usa di default `passwords.json`, `master_pwd.hash`, `kdf.salt`, `vault_key.json` nella **radice del repository** (stesso vault dell'app Streamlit). Per puntare altrove (es. nei test), sovrascrivi con le variabili d'ambiente `PWM_HASH_FILE`, `PWM_SALT_FILE`, `PWM_DB_FILE`, `PWM_KEY_FILE`.
 
 ### Frontend (porta 5173)
 

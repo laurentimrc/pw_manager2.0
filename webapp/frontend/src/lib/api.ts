@@ -1,8 +1,10 @@
 import type {
+  AuthResult,
   AuthStatus,
   CredentialListResponse,
   CredentialSecret,
   GeneratorOptions,
+  RecoverCompleteResult,
   SecurityDashboard,
   SortBy,
   StrengthResult,
@@ -82,9 +84,14 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
 export const api = {
   getAuthStatus: () => request<AuthStatus>('/api/auth/status'),
   setup: (new_password: string, confirm_password: string) =>
-    postJson<{ authenticated: boolean }>('/api/auth/setup', { new_password, confirm_password }),
-  login: (password: string) => postJson<{ authenticated: boolean }>('/api/auth/login', { password }),
+    postJson<AuthResult>('/api/auth/setup', { new_password, confirm_password }),
+  login: (password: string) => postJson<AuthResult>('/api/auth/login', { password }),
   logout: () => postJson<{ authenticated: boolean }>('/api/auth/logout', {}),
+
+  verifyRecoveryCode: (recovery_code: string) =>
+    postJson<{ valid: boolean }>('/api/auth/recover/verify', { recovery_code }),
+  completeRecovery: (recovery_code: string, new_password: string, confirm_password: string) =>
+    postJson<RecoverCompleteResult>('/api/auth/recover', { recovery_code, new_password, confirm_password }),
 
   passwordStrength: (password: string) => postJson<StrengthResult>('/api/password-strength', { password }),
   generatePassword: (options: GeneratorOptions) =>

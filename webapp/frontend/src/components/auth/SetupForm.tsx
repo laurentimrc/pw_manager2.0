@@ -5,6 +5,7 @@ import { Label } from '@/components/ui/Label'
 import { Button } from '@/components/ui/Button'
 import { Alert } from '@/components/ui/Alert'
 import { PasswordStrengthMeter } from '@/components/credentials/PasswordStrengthMeter'
+import { RecoveryCodeReveal } from '@/components/auth/RecoveryCodeReveal'
 import { api, ApiError } from '@/lib/api'
 
 export function SetupForm({ onDone }: { onDone: () => void }) {
@@ -12,6 +13,7 @@ export function SetupForm({ onDone }: { onDone: () => void }) {
   const [confirmPassword, setConfirmPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [recoveryCode, setRecoveryCode] = useState<string | null>(null)
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()
@@ -32,13 +34,30 @@ export function SetupForm({ onDone }: { onDone: () => void }) {
 
     setSubmitting(true)
     try {
-      await api.setup(newPassword, confirmPassword)
-      onDone()
+      const result = await api.setup(newPassword, confirmPassword)
+      if (result.recovery_code) {
+        // La sessione è già attiva (il setup autentica subito), ma non
+        // entriamo nell'app finché l'utente non conferma esplicitamente di
+        // aver salvato il codice di recovery.
+        setRecoveryCode(result.recovery_code)
+      } else {
+        onDone()
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Errore durante il setup.')
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (recoveryCode) {
+    return (
+      <RecoveryCodeReveal
+        code={recoveryCode}
+        description="La tua Master Password è stata impostata. Questo codice ti permetterà di recuperare l'accesso al vault se in futuro dimenticassi la Master Password."
+        onConfirm={onDone}
+      />
+    )
   }
 
   return (

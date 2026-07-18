@@ -11,7 +11,7 @@ nei test, che puntano a directory temporanee).
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 # app/config.py -> app -> backend -> webapp -> radice del repository
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -22,6 +22,7 @@ class Settings:
     hash_file: str
     salt_file: str
     db_file: str
+    key_file: Optional[str] = None
     cookie_name: str = "pwm_session"
     cookie_secure: bool = False
     cors_origins: List[str] = field(default_factory=lambda: ["http://127.0.0.1:5173"])
@@ -39,6 +40,7 @@ def default_settings() -> Settings:
         hash_file=os.environ.get("PWM_HASH_FILE", str(REPO_ROOT / "master_pwd.hash")),
         salt_file=os.environ.get("PWM_SALT_FILE", str(REPO_ROOT / "kdf.salt")),
         db_file=os.environ.get("PWM_DB_FILE", str(REPO_ROOT / "passwords.json")),
+        key_file=os.environ.get("PWM_KEY_FILE", str(REPO_ROOT / "vault_key.json")),
         cookie_secure=os.environ.get("PWM_COOKIE_SECURE", "false").strip().lower() == "true",
         cors_origins=cors_origins,
         max_login_attempts=int(os.environ.get("PWM_MAX_LOGIN_ATTEMPTS", "5")),

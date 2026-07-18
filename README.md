@@ -20,9 +20,11 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
 * **Autenticazione Robusta con Master Password:**
     * Setup iniziale di una master password.
     * Hashing della master password utilizzando `bcrypt` per una memorizzazione sicura del digest.
-* **Derivazione della Chiave di Crittografia (KDF):**
-    * La chiave utilizzata per criptare e decriptare le password dei servizi è derivata dalla master password e da un "salt" unico utilizzando PBKDF2HMAC (`hashlib`).
-    * Questo elimina la necessità di un file chiave separato per la crittografia dei dati, legandola direttamente alla master password.
+* **Chiave di Crittografia a due livelli (DEK/KEK) con Recovery:**
+    * Le credenziali sono criptate con una **Data Encryption Key (DEK)** casuale, indipendente dalla master password.
+    * La DEK è a sua volta "avvolta" (wrapped) da due Key Encryption Key (KEK) derivate via PBKDF2HMAC (`hashlib`): una dalla master password, una da un **codice di recovery** ad alta entropia mostrato una sola volta al momento del setup.
+    * Se dimentichi la master password, il codice di recovery permette di sbloccare nuovamente il vault, impostare una nuova master password e ottenere un nuovo codice di recovery (quello usato viene invalidato). **Questo flusso di recovery è disponibile solo nella webapp React** (vedi sotto); l'interfaccia Streamlit continua a funzionare per setup/login/cambio master password ma non espone una UI per il recovery.
+    * I vault creati con versioni precedenti dell'app (senza DEK) vengono migrati automaticamente e in modo trasparente al formato con DEK/recovery al primo sblocco riuscito.
 * **Crittografia dei Dati:**
     * Le password dei singoli servizi sono criptate utilizzando la crittografia simmetrica Fernet (dalla libreria `cryptography`) prima di essere salvate.
 * **Gestione delle Credenziali:**
@@ -60,7 +62,7 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
     * `bcrypt`: Per l'hashing della master password.
     * `zxcvbn-python`: Per la valutazione della robustezza delle password.
     * `pyotp`: Per la generazione dei codici 2FA (TOTP).
-    * Librerie standard: `json`, `base64`, `random`, `string`, `os`, `hashlib`.
+    * Librerie standard: `json`, `base64`, `random`, `secrets`, `string`, `os`, `hashlib`.
 
 ---
 
@@ -113,6 +115,6 @@ pytest tests/
 
 Oltre all'interfaccia Streamlit, il progetto include una **seconda interfaccia**, opzionale e indipendente, nella cartella [`webapp/`](webapp/): un frontend React/TypeScript con look moderno (Tailwind, componenti in stile shadcn/ui) e un backend FastAPI, entrambi pensati per uso locale (il backend ascolta solo su `127.0.0.1`).
 
-Le due interfacce sono equivalenti dal punto di vista funzionale e operano sullo **stesso vault** (`passwords.json`, `master_pwd.hash`, `kdf.salt` nella radice del repository): riusano entrambe `password_manager.py` senza duplicare la logica di dominio. Puoi usare l'una o l'altra indifferentemente (non contemporaneamente sullo stesso file di lock del processo, ma sugli stessi dati).
+Le due interfacce operano sullo **stesso vault** (`passwords.json`, `master_pwd.hash`, `kdf.salt`, `vault_key.json` nella radice del repository): riusano entrambe `password_manager.py` senza duplicare la logica di dominio. Puoi usare l'una o l'altra indifferentemente (non contemporaneamente sullo stesso file di lock del processo, ma sugli stessi dati). Le due interfacce sono equivalenti per setup/login/gestione credenziali/cambio master password; il **recovery della master password dimenticata** (via codice di recovery) è invece disponibile solo nella webapp React, che espone la relativa UI — la logica di dominio sottostante è comunque condivisa, quindi un vault può essere recuperato con la webapp e poi riaperto normalmente con Streamlit.
 
 Per l'avvio e i dettagli architetturali vedi [`webapp/README.md`](webapp/README.md).

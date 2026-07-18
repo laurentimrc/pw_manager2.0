@@ -2,16 +2,20 @@ import { useCallback, useEffect, useState } from 'react'
 import { CenteredScreen } from '@/components/layout/CenteredScreen'
 import { SetupForm } from '@/components/auth/SetupForm'
 import { LoginForm } from '@/components/auth/LoginForm'
+import { ForgotPasswordForm } from '@/components/auth/ForgotPasswordForm'
 import { AuthenticatedApp } from '@/AuthenticatedApp'
 import { Alert } from '@/components/ui/Alert'
 import { api, setUnauthorizedHandler, type UnauthorizedReason } from '@/lib/api'
 import type { AuthStatus } from '@/types'
+
+type AuthScreen = 'login' | 'forgot-password'
 
 export default function App() {
   const [status, setStatus] = useState<AuthStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [sessionMessage, setSessionMessage] = useState<string | null>(null)
+  const [authScreen, setAuthScreen] = useState<AuthScreen>('login')
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -75,13 +79,25 @@ export default function App() {
               {sessionMessage}
             </Alert>
           )}
-          <LoginForm
-            initialLockoutSeconds={status.lockout_remaining_seconds}
-            onDone={() => {
-              setSessionMessage(null)
-              refreshStatus()
-            }}
-          />
+          {authScreen === 'forgot-password' ? (
+            <ForgotPasswordForm
+              onBackToLogin={() => setAuthScreen('login')}
+              onDone={() => {
+                setAuthScreen('login')
+                setSessionMessage(null)
+                refreshStatus()
+              }}
+            />
+          ) : (
+            <LoginForm
+              initialLockoutSeconds={status.lockout_remaining_seconds}
+              onForgotPassword={() => setAuthScreen('forgot-password')}
+              onDone={() => {
+                setSessionMessage(null)
+                refreshStatus()
+              }}
+            />
+          )}
         </div>
       </CenteredScreen>
     )
