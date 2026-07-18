@@ -411,6 +411,56 @@ class TestRecovery:
         assert secret.json()["password"] == "hunter2-Strong!"
 
 
+class TestRegenerateRecoveryCode:
+    """Copre la rigenerazione del codice di recovery a richiesta dall'Utility,
+    disponibile in qualunque momento da autenticati (non solo al primo setup
+    o alla migrazione automatica di un vault legacy)."""
+
+    def test_regenerate_requires_authentication(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.post("/api/utility/recovery-code", json={"current_password": MASTER_PASSWORD})
+        assert resp.status_code == 401
+
+    def test_regenerate_returns_new_code_different_from_first(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.post("/api/auth/setup", json={
+            "new_password": MASTER_PASSWORD, "confirm_password": MASTER_PASSWORD,
+        })
+        first_code = resp.json()["recovery_code"]
+
+        resp = client.post("/api/utility/recovery-code", json={"current_password": MASTER_PASSWORD})
+        assert resp.status_code == 200
+        new_code = resp.json()["recovery_code"]
+        assert new_code
+        assert new_code != first_code
+
+        # Il vecchio codice non è più valido, il nuovo sì.
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": first_code})
+        assert resp.status_code == 400
+        resp = client.post("/api/auth/recover/verify", json={"recovery_code": new_code})
+        assert resp.status_code == 200
+
+    def test_regenerate_wrong_current_password_fails(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        resp = client.post("/api/utility/recovery-code", json={"current_password": "WrongPassword"})
+        assert resp.status_code == 400
+
+    def test_regenerate_does_not_affect_credential_data(self, tmp_path):
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "octocat@example.com", "password": "hunter2-Strong!",
+        })
+
+        resp = client.post("/api/utility/recovery-code", json={"current_password": MASTER_PASSWORD})
+        assert resp.status_code == 200
+
+        secret = client.get("/api/credentials/GitHub/secret")
+        assert secret.status_code == 200
+        assert secret.json()["password"] == "hunter2-Strong!"
+
+
 class TestPasswordHelpers:
     def test_password_strength_endpoint_is_public(self, tmp_path):
         client = make_client(tmp_path)

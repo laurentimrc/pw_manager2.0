@@ -267,6 +267,53 @@ class TestVaultKeyAndRecovery:
         assert recovering_manager.recover_with_code(recovery_code) is None
 
 
+class TestRegenerateRecoveryCode:
+    """Copre la rigenerazione del codice di recovery a richiesta (senza
+    cambiare la master password), disponibile in qualunque momento da
+    autenticati - non solo al primo setup/migrazione."""
+
+    def test_regenerate_returns_new_code_and_invalidates_old(self, manager):
+        password, first_code = unlock_with_recovery(manager)
+
+        new_code = manager.regenerate_recovery_code(password)
+
+        assert new_code
+        assert new_code != first_code
+        assert manager.verify_recovery_code(new_code)
+        assert not manager.verify_recovery_code(first_code)
+
+    def test_regenerate_wrong_password_returns_none(self, manager):
+        unlock_with_recovery(manager)
+        assert manager.regenerate_recovery_code("WrongPassword") is None
+
+    def test_regenerate_without_vault_returns_none(self, manager):
+        assert manager.regenerate_recovery_code("AnyPassword") is None
+
+    def test_regenerate_does_not_change_dek_or_data(self, manager):
+        password, _ = unlock_with_recovery(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+
+        new_code = manager.regenerate_recovery_code(password)
+        assert new_code
+
+        # La DEK non cambia: le credenziali restano leggibili con la stessa
+        # master password, nessuna ri-crittografia necessaria.
+        decrypted = manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["password"] == "hunter2"
+
+    def test_new_code_can_recover_vault(self, manager):
+        password, _ = unlock_with_recovery(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+        new_code = manager.regenerate_recovery_code(password)
+
+        recovering_manager = PasswordManager(manager.hash_file, manager.salt_file, manager.db_file, manager.key_file)
+        dek = recovering_manager.recover_with_code(new_code)
+        assert dek is not None
+        recovering_manager.cipher_suite = Fernet(dek)
+        decrypted = recovering_manager.get_decrypted_passwords()
+        assert decrypted["GitHub"]["password"] == "hunter2"
+
+
 class TestLegacyVaultMigration:
     """Un vault creato PRIMA di questa funzionalità non ha `key_file`: i dati
     sono ancora criptati direttamente con la KEK master. La migrazione deve

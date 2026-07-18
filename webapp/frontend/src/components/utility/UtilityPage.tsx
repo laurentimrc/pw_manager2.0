@@ -2,6 +2,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/Tabs'
 import { ExportPanel } from '@/components/utility/ExportPanel'
 import { ImportPanel } from '@/components/utility/ImportPanel'
 import { ChangeMasterPasswordPanel } from '@/components/utility/ChangeMasterPasswordPanel'
+import { RecoveryCodePanel } from '@/components/utility/RecoveryCodePanel'
 
 export function UtilityPage() {
   return (
@@ -12,6 +13,7 @@ export function UtilityPage() {
           <TabsTrigger value="export">Esporta</TabsTrigger>
           <TabsTrigger value="import">Importa</TabsTrigger>
           <TabsTrigger value="master">Cambia Master Password</TabsTrigger>
+          <TabsTrigger value="recovery">Codice di Recovery</TabsTrigger>
         </TabsList>
         <TabsContent value="export">
           <ExportPanel />
@@ -21,6 +23,9 @@ export function UtilityPage() {
         </TabsContent>
         <TabsContent value="master">
           <ChangeMasterPasswordPanel />
+        </TabsContent>
+        <TabsContent value="recovery">
+          <RecoveryCodePanel />
         </TabsContent>
       </Tabs>
     </div>

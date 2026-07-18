@@ -44,6 +44,7 @@ from .schemas import (
     PasswordStrengthRequest,
     RecoverCompleteRequest,
     RecoverVerifyRequest,
+    RegenerateRecoveryCodeRequest,
     SetupRequest,
     UpdateCredentialRequest,
 )
@@ -450,6 +451,27 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         session_id = request.cookies.get(settings.cookie_name)
         sessions.update_credentials(session_id, payload.new_password, manager.cipher_suite)
         return {"message": message}
+
+    @app.post("/api/utility/recovery-code")
+    def regenerate_recovery_code(payload: RegenerateRecoveryCodeRequest,
+                                  session: SessionData = Depends(require_session)):
+        """Genera un nuovo codice di recovery in qualunque momento da
+        autenticati, senza cambiare la master password: invalida quello
+        precedente. Richiede la master password corrente come conferma
+        esplicita, stesso principio di change-master-password."""
+        if not payload.current_password:
+            raise HTTPException(status_code=400, detail="La Master Password corrente è obbligatoria.")
+        if payload.current_password != session.master_password:
+            raise HTTPException(
+                status_code=400,
+                detail="La Master Password inserita non corrisponde a quella della sessione corrente.",
+            )
+
+        manager = get_manager()
+        new_code = manager.regenerate_recovery_code(payload.current_password)
+        if new_code is None:
+            raise HTTPException(status_code=400, detail="Impossibile generare un nuovo codice di recovery.")
+        return {"recovery_code": new_code}
 
     return app
 

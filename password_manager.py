@@ -252,6 +252,31 @@ class PasswordManager:
         self.cipher_suite = Fernet(dek)
         return new_recovery_code
 
+    def regenerate_recovery_code(self, current_password: str) -> Optional[str]:
+        """Genera un nuovo codice di recovery senza cambiare la master
+        password: invalida il codice precedente (il file di materiale
+        crittografico viene interamente sovrascritto, esattamente come in
+        `complete_recovery`). Richiede la master password corrente come
+        conferma esplicita, stesso principio di `change_master_password`.
+        Restituisce None se la password è errata o il vault non è ancora nel
+        formato con DEK (nessun login riuscito finora)."""
+        if not self.verify_master_password(current_password):
+            return None
+        salt = self.load_kdf_salt()
+        if not salt:
+            return None
+        key_material = self._load_key_material()
+        if key_material is None:
+            return None
+        master_kek = self._derive_kek(current_password, salt)
+        try:
+            dek = Fernet(master_kek).decrypt(key_material["dek_wrapped_by_master"].encode())
+        except Exception:
+            return None
+        new_key_material, new_code = self._build_key_material(dek, master_kek)
+        self._save_key_material(new_key_material)
+        return new_code
+
     # --- Gestione Database ---
     def load_encrypted_db(self) -> Dict[str, Any]:
         try:

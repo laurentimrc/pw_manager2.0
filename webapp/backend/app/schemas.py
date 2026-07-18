@@ -52,6 +52,10 @@ class ChangeMasterPasswordRequest(BaseModel):
     confirm_password: str
 
 
+class RegenerateRecoveryCodeRequest(BaseModel):
+    current_password: str
+
+
 class PasswordStrengthRequest(BaseModel):
     password: str = ""
 

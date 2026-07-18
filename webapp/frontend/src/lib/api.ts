@@ -126,4 +126,6 @@ export const api = {
       new_password,
       confirm_password,
     }),
+  regenerateRecoveryCode: (current_password: string) =>
+    postJson<RecoverCompleteResult>('/api/utility/recovery-code', { current_password }),
 }
