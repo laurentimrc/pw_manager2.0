@@ -26,6 +26,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from password_manager import (  # noqa: E402  (import dopo la manipolazione di sys.path)
+    ITEM_TYPE_CARD,
+    ITEM_TYPE_LOGIN,
+    ITEM_TYPE_NOTE,
     PasswordManager,
     VaultCorruptedError,
     check_password_breach,
@@ -39,7 +42,9 @@ from password_manager import (  # noqa: E402  (import dopo la manipolazione di s
 
 from .config import Settings, default_settings
 from .schemas import (
+    AddCardRequest,
     AddCredentialRequest,
+    AddNoteRequest,
     ChangeMasterPasswordRequest,
     ImportRequest,
     LoginRequest,
@@ -49,7 +54,9 @@ from .schemas import (
     RecoverVerifyRequest,
     RegenerateRecoveryCodeRequest,
     SetupRequest,
+    UpdateCardRequest,
     UpdateCredentialRequest,
+    UpdateNoteRequest,
 )
 from .sessions import LoginGuard, SessionData, SessionStore
 
@@ -337,19 +344,44 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Seleziona almeno un tipo di carattere.")
         return {"password": password}
 
+    # --- Tag (trasversali a login/note/carte) ---
+    def tags_by_key(manager: PasswordManager, item_type: Optional[str] = None) -> Dict[str, List[str]]:
+        """Mappa chiave -> tag per tutte le voci del vault (o solo per un
+        tipo), usando `get_decrypted_items` (mai `get_decrypted_passwords`,
+        che non espone i tag - vedi password_manager.py)."""
+        items = manager.get_decrypted_items() or []
+        return {
+            i["key"]: i.get("tags", [])
+            for i in items
+            if item_type is None or i.get("type", ITEM_TYPE_LOGIN) == item_type
+        }
+
+    @app.get("/api/tags")
+    def list_tags(session: SessionData = Depends(require_session)):
+        """Elenco di tutti i tag distinti usati nel vault (login + note +
+        carte), usato dal frontend per costruire il filtro per tag."""
+        manager = manager_for_session(session)
+        all_tags = {tag for tags in tags_by_key(manager).values() for tag in tags}
+        return {"tags": sorted(all_tags, key=str.lower)}
+
     # --- Credenziali ---
     @app.get("/api/credentials")
-    def list_credentials(search: str = "", sort_by: str = "name",
+    def list_credentials(search: str = "", sort_by: str = "name", tag: str = "",
                           session: SessionData = Depends(require_session)):
         manager = manager_for_session(session)
         decrypted = manager.get_decrypted_passwords()
         if decrypted is None:
             raise HTTPException(status_code=500, detail="Impossibile decriptare i dati.")
 
+        service_tags = tags_by_key(manager, ITEM_TYPE_LOGIN)
         flags = compute_security_flags(decrypted)
         search_lower = search.lower().strip()
-        filtered = ({s: d for s, d in decrypted.items() if search_lower in s.lower()}
-                    if search_lower else decrypted)
+        tag_filter = tag.strip()
+        filtered = {
+            s: d for s, d in decrypted.items()
+            if (not search_lower or search_lower in s.lower())
+            and (not tag_filter or tag_filter in service_tags.get(s, []))
+        }
         ordered = sort_credentials(filtered, sort_by)
 
         items = []
@@ -360,6 +392,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "last_updated": data.get("last_updated"),
                 "has_totp": bool(data.get("totp_secret")),
                 "flags": flags.get(service, []),
+                "tags": service_tags.get(service, []),
                 "decryption_error": "password" not in data or data.get("password") == "ERRORE DI DECRIPTAZIONE",
             })
 
@@ -377,6 +410,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "username": data.get("username", ""),
             "password": data.get("password", ""),
             "totp_secret": data.get("totp_secret", ""),
+            "tags": tags_by_key(manager, ITEM_TYPE_LOGIN).get(service, []),
         }
 
     @app.get("/api/credentials/{service}/totp")
@@ -403,7 +437,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         existing = manager.load_encrypted_db()
         if service in existing:
             raise HTTPException(status_code=409, detail=f"Un servizio con nome '{service}' esiste già.")
-        manager.add_credential(service, payload.username, payload.password, payload.totp_secret)
+        manager.add_credential(service, payload.username, payload.password, payload.totp_secret, payload.tags)
         return {"service": service}
 
     @app.put("/api/credentials/{service}")
@@ -415,17 +449,162 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Servizio non trovato.")
         if not payload.username or not payload.password:
             raise HTTPException(status_code=400, detail="Username e Password sono obbligatori.")
-        manager.update_credential(service, payload.username, payload.password, payload.totp_secret)
+        manager.update_credential(service, payload.username, payload.password, payload.totp_secret, payload.tags)
         return {"service": service}
 
     @app.delete("/api/credentials/{service}")
     def delete_credential(service: str, session: SessionData = Depends(require_session)):
+        """Elimina una voce del vault per chiave: `PasswordManager.delete_credential`
+        è generico rispetto al tipo (login, nota o carta), quindi questo stesso
+        endpoint viene riusato dal frontend anche per eliminare note e carte,
+        invece di duplicare la logica di cancellazione per ogni tipo."""
         manager = manager_for_session(session)
         existing = manager.load_encrypted_db()
         if service not in existing:
-            raise HTTPException(status_code=404, detail="Servizio non trovato.")
+            raise HTTPException(status_code=404, detail="Voce non trovata.")
         manager.delete_credential(service)
         return {"deleted": service}
+
+    # --- Note sicure ---
+    @app.get("/api/notes")
+    def list_notes(search: str = "", tag: str = "", session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        items = manager.get_decrypted_items()
+        if items is None:
+            raise HTTPException(status_code=500, detail="Impossibile decriptare i dati.")
+        notes = [i for i in items if i.get("type") == ITEM_TYPE_NOTE]
+
+        search_lower = search.lower().strip()
+        tag_filter = tag.strip()
+        filtered = [
+            n for n in notes
+            if (not search_lower or search_lower in n["key"].lower())
+            and (not tag_filter or tag_filter in n.get("tags", []))
+        ]
+        filtered.sort(key=lambda n: n["key"].lower())
+
+        result_items = [{
+            "key": n["key"],
+            "tags": n.get("tags", []),
+            "last_updated": n.get("last_updated"),
+            "decryption_error": "error" in n,
+        } for n in filtered]
+        return {"items": result_items, "total": len(notes), "filtered_total": len(filtered)}
+
+    @app.get("/api/notes/{key}/secret")
+    def get_note_secret(key: str, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        items = manager.get_decrypted_items() or []
+        note = next((i for i in items if i["key"] == key and i.get("type") == ITEM_TYPE_NOTE), None)
+        if note is None:
+            raise HTTPException(status_code=404, detail="Nota non trovata.")
+        return {
+            "key": key,
+            "content": note.get("content", ""),
+            "tags": note.get("tags", []),
+            "last_updated": note.get("last_updated"),
+        }
+
+    @app.post("/api/notes", status_code=201)
+    def add_note(payload: AddNoteRequest, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        title = payload.title.strip()
+        if not title or not payload.content:
+            raise HTTPException(status_code=400, detail="I campi Titolo e Contenuto sono obbligatori.")
+        existing = manager.load_encrypted_db()
+        if title in existing:
+            raise HTTPException(status_code=409, detail=f"Una voce con nome '{title}' esiste già.")
+        manager.add_note(title, payload.content, payload.tags)
+        return {"key": title}
+
+    @app.put("/api/notes/{key}")
+    def update_note(key: str, payload: UpdateNoteRequest, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        existing = manager.load_encrypted_db()
+        if key not in existing or existing[key].get("type") != ITEM_TYPE_NOTE:
+            raise HTTPException(status_code=404, detail="Nota non trovata.")
+        if not payload.content:
+            raise HTTPException(status_code=400, detail="Il contenuto è obbligatorio.")
+        manager.update_note(key, payload.content, payload.tags)
+        return {"key": key}
+
+    # --- Carte di pagamento ---
+    @app.get("/api/cards")
+    def list_cards(search: str = "", tag: str = "", session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        items = manager.get_decrypted_items()
+        if items is None:
+            raise HTTPException(status_code=500, detail="Impossibile decriptare i dati.")
+        cards = [i for i in items if i.get("type") == ITEM_TYPE_CARD]
+
+        search_lower = search.lower().strip()
+        tag_filter = tag.strip()
+        filtered = [
+            c for c in cards
+            if (not search_lower or search_lower in c["key"].lower())
+            and (not tag_filter or tag_filter in c.get("tags", []))
+        ]
+        filtered.sort(key=lambda c: c["key"].lower())
+
+        result_items = []
+        for c in filtered:
+            number = c.get("card_number", "")
+            last4 = number[-4:] if len(number) >= 4 else number
+            result_items.append({
+                "key": c["key"],
+                # L'intestatario e la scadenza non sono considerati campi da
+                # mascherare (solo numero carta e CVV lo sono, come richiesto):
+                # possono comparire già nell'elenco, come lo username per i
+                # login. Il numero completo e il CVV restano nascosti finché
+                # non viene richiesto esplicitamente `/api/cards/{key}/secret`.
+                "cardholder": c.get("cardholder", ""),
+                "expiry": c.get("expiry", ""),
+                "card_number_last4": last4,
+                "tags": c.get("tags", []),
+                "last_updated": c.get("last_updated"),
+                "decryption_error": "error" in c,
+            })
+        return {"items": result_items, "total": len(cards), "filtered_total": len(filtered)}
+
+    @app.get("/api/cards/{key}/secret")
+    def get_card_secret(key: str, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        items = manager.get_decrypted_items() or []
+        card = next((i for i in items if i["key"] == key and i.get("type") == ITEM_TYPE_CARD), None)
+        if card is None:
+            raise HTTPException(status_code=404, detail="Carta non trovata.")
+        return {
+            "key": key,
+            "cardholder": card.get("cardholder", ""),
+            "card_number": card.get("card_number", ""),
+            "expiry": card.get("expiry", ""),
+            "cvv": card.get("cvv", ""),
+            "tags": card.get("tags", []),
+            "last_updated": card.get("last_updated"),
+        }
+
+    @app.post("/api/cards", status_code=201)
+    def add_card(payload: AddCardRequest, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        name = payload.name.strip()
+        if not name or not payload.card_number:
+            raise HTTPException(status_code=400, detail="I campi Nome e Numero Carta sono obbligatori.")
+        existing = manager.load_encrypted_db()
+        if name in existing:
+            raise HTTPException(status_code=409, detail=f"Una voce con nome '{name}' esiste già.")
+        manager.add_card(name, payload.cardholder, payload.card_number, payload.expiry, payload.cvv, payload.tags)
+        return {"key": name}
+
+    @app.put("/api/cards/{key}")
+    def update_card(key: str, payload: UpdateCardRequest, session: SessionData = Depends(require_session)):
+        manager = manager_for_session(session)
+        existing = manager.load_encrypted_db()
+        if key not in existing or existing[key].get("type") != ITEM_TYPE_CARD:
+            raise HTTPException(status_code=404, detail="Carta non trovata.")
+        if not payload.card_number:
+            raise HTTPException(status_code=400, detail="Il numero carta è obbligatorio.")
+        manager.update_card(key, payload.cardholder, payload.card_number, payload.expiry, payload.cvv, payload.tags)
+        return {"key": key}
 
     # --- Dashboard sicurezza ---
     @app.get("/api/security/dashboard")

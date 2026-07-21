@@ -3,13 +3,18 @@ import type {
   AuthStatus,
   BreachCheckResult,
   BulkBreachCheckResponse,
+  CardListResponse,
+  CardSecret,
   CredentialListResponse,
   CredentialSecret,
   GeneratorOptions,
+  NoteListResponse,
+  NoteSecret,
   RecoverCompleteResult,
   SecurityDashboard,
   SortBy,
   StrengthResult,
+  TagsResponse,
   TotpInfo,
 } from '@/types'
 
@@ -99,23 +104,76 @@ export const api = {
   generatePassword: (options: GeneratorOptions) =>
     postJson<{ password: string }>('/api/password-generator', options),
 
-  listCredentials: (search: string, sortBy: SortBy) => {
-    const params = new URLSearchParams({ search, sort_by: sortBy })
+  listCredentials: (search: string, sortBy: SortBy, tag = '') => {
+    const params = new URLSearchParams({ search, sort_by: sortBy, tag })
     return request<CredentialListResponse>(`/api/credentials?${params.toString()}`)
   },
   getCredentialSecret: (service: string) =>
     request<CredentialSecret>(`/api/credentials/${encodeURIComponent(service)}/secret`),
   getCredentialTotp: (service: string) =>
     request<TotpInfo>(`/api/credentials/${encodeURIComponent(service)}/totp`),
-  addCredential: (service: string, username: string, password: string, totp_secret: string) =>
-    postJson<{ service: string }>('/api/credentials', { service, username, password, totp_secret }),
-  updateCredential: (service: string, username: string, password: string, totp_secret: string) =>
+  addCredential: (service: string, username: string, password: string, totp_secret: string, tags: string[] = []) =>
+    postJson<{ service: string }>('/api/credentials', { service, username, password, totp_secret, tags }),
+  updateCredential: (
+    service: string,
+    username: string,
+    password: string,
+    totp_secret: string,
+    tags: string[] = [],
+  ) =>
     request<{ service: string }>(`/api/credentials/${encodeURIComponent(service)}`, {
       method: 'PUT',
-      body: JSON.stringify({ username, password, totp_secret }),
+      body: JSON.stringify({ username, password, totp_secret, tags }),
     }),
   deleteCredential: (service: string) =>
     request<{ deleted: string }>(`/api/credentials/${encodeURIComponent(service)}`, { method: 'DELETE' }),
+
+  // --- Note sicure ---
+  listNotes: (search: string, tag = '') => {
+    const params = new URLSearchParams({ search, tag })
+    return request<NoteListResponse>(`/api/notes?${params.toString()}`)
+  },
+  getNoteSecret: (key: string) => request<NoteSecret>(`/api/notes/${encodeURIComponent(key)}/secret`),
+  addNote: (title: string, content: string, tags: string[] = []) =>
+    postJson<{ key: string }>('/api/notes', { title, content, tags }),
+  updateNote: (key: string, content: string, tags: string[] = []) =>
+    request<{ key: string }>(`/api/notes/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ content, tags }),
+    }),
+  // Il DELETE è generico per chiave (login/nota/carta): riusa lo stesso
+  // endpoint di `deleteCredential`, vedi commento nel backend.
+  deleteNote: (key: string) => api.deleteCredential(key),
+
+  // --- Carte di pagamento ---
+  listCards: (search: string, tag = '') => {
+    const params = new URLSearchParams({ search, tag })
+    return request<CardListResponse>(`/api/cards?${params.toString()}`)
+  },
+  getCardSecret: (key: string) => request<CardSecret>(`/api/cards/${encodeURIComponent(key)}/secret`),
+  addCard: (
+    name: string,
+    cardholder: string,
+    card_number: string,
+    expiry: string,
+    cvv: string,
+    tags: string[] = [],
+  ) => postJson<{ key: string }>('/api/cards', { name, cardholder, card_number, expiry, cvv, tags }),
+  updateCard: (
+    key: string,
+    cardholder: string,
+    card_number: string,
+    expiry: string,
+    cvv: string,
+    tags: string[] = [],
+  ) =>
+    request<{ key: string }>(`/api/cards/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ cardholder, card_number, expiry, cvv, tags }),
+    }),
+  deleteCard: (key: string) => api.deleteCredential(key),
+
+  listTags: () => request<TagsResponse>('/api/tags'),
 
   getSecurityDashboard: () => request<SecurityDashboard>('/api/security/dashboard'),
   checkCredentialBreach: (service: string) =>

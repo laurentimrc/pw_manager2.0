@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { Search } from 'lucide-react'
 import { Input } from '@/components/ui/Input'
 import { Alert } from '@/components/ui/Alert'
+import { TagFilterBar } from '@/components/ui/TagFilterBar'
 import { CredentialItem } from '@/components/credentials/CredentialItem'
 import { api, ApiError } from '@/lib/api'
 import { useDebouncedValue } from '@/hooks/useDebouncedValue'
+import { useTags } from '@/hooks/useTags'
 import type { CredentialListResponse, SortBy } from '@/types'
 
 const SORT_OPTIONS: { value: SortBy; label: string }[] = [
@@ -17,14 +19,17 @@ export function CredentialList({ onCountChanged }: { onCountChanged: (total: num
   const [search, setSearch] = useState('')
   const debouncedSearch = useDebouncedValue(search, 250)
   const [sortBy, setSortBy] = useState<SortBy>('name')
+  const [tag, setTag] = useState('')
   const [data, setData] = useState<CredentialListResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [editingService, setEditingService] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [tagsRefresh, setTagsRefresh] = useState(0)
+  const availableTags = useTags(tagsRefresh)
 
   const refresh = useCallback(async () => {
     try {
-      const result = await api.listCredentials(debouncedSearch, sortBy)
+      const result = await api.listCredentials(debouncedSearch, sortBy, tag)
       setData(result)
       setError(null)
       onCountChanged(result.total)
@@ -32,7 +37,7 @@ export function CredentialList({ onCountChanged }: { onCountChanged: (total: num
       setError(err instanceof ApiError ? err.message : 'Errore nel caricamento delle credenziali.')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch, sortBy])
+  }, [debouncedSearch, sortBy, tag])
 
   useEffect(() => {
     setPendingDelete(null)
@@ -68,6 +73,8 @@ export function CredentialList({ onCountChanged }: { onCountChanged: (total: num
         </select>
       </div>
 
+      <TagFilterBar tags={availableTags} selected={tag} onSelect={setTag} />
+
       {error && <Alert variant="destructive">{error}</Alert>}
 
       {data && (
@@ -93,12 +100,14 @@ export function CredentialList({ onCountChanged }: { onCountChanged: (total: num
             onSaved={() => {
               setEditingService(null)
               refresh()
+              setTagsRefresh((v) => v + 1)
             }}
             onRequestDelete={(service) => setPendingDelete(service)}
             onCancelDelete={() => setPendingDelete(null)}
             onDeleted={() => {
               setPendingDelete(null)
               refresh()
+              setTagsRefresh((v) => v + 1)
             }}
           />
         ))}

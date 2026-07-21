@@ -26,6 +26,7 @@ export interface CredentialListItem {
   last_updated: string | null
   has_totp: boolean
   flags: SecurityFlag[]
+  tags: string[]
   decryption_error: boolean
 }
 
@@ -40,6 +41,66 @@ export interface CredentialSecret {
   username: string
   password: string
   totp_secret: string
+  tags: string[]
+}
+
+/** Note sicure e carte di pagamento condividono lo stesso concetto di
+ * "voce del vault" dei login (stesso file cifrato, stesso spazio di chiavi),
+ * ma hanno campi propri: vedi `NoteListItem`/`NoteSecret` e
+ * `CardListItem`/`CardSecret`. */
+export interface NoteListItem {
+  key: string
+  tags: string[]
+  last_updated: string | null
+  decryption_error: boolean
+}
+
+export interface NoteListResponse {
+  items: NoteListItem[]
+  total: number
+  filtered_total: number
+}
+
+export interface NoteSecret {
+  key: string
+  content: string
+  tags: string[]
+  last_updated: string | null
+}
+
+export interface CardListItem {
+  key: string
+  /** Intestatario e scadenza non sono mascherati (solo numero carta e CVV lo
+   * sono): compaiono già nell'elenco, come lo username per i login. */
+  cardholder: string
+  expiry: string
+  /** Ultime 4 cifre del numero carta, per riconoscere la carta nell'elenco
+   * senza doverla espandere: il numero completo resta mascherato finché non
+   * viene esplicitamente richiesto (vedi `CardSecret`). */
+  card_number_last4: string
+  tags: string[]
+  last_updated: string | null
+  decryption_error: boolean
+}
+
+export interface CardListResponse {
+  items: CardListItem[]
+  total: number
+  filtered_total: number
+}
+
+export interface CardSecret {
+  key: string
+  cardholder: string
+  card_number: string
+  expiry: string
+  cvv: string
+  tags: string[]
+  last_updated: string | null
+}
+
+export interface TagsResponse {
+  tags: string[]
 }
 
 export interface TotpInfo {

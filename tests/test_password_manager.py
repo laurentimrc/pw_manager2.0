@@ -10,6 +10,9 @@ import pytest
 from cryptography.fernet import Fernet
 
 from password_manager import (
+    ITEM_TYPE_CARD,
+    ITEM_TYPE_LOGIN,
+    ITEM_TYPE_NOTE,
     PBKDF2_ITERATIONS,
     PasswordManager,
     VaultCorruptedError,
@@ -20,6 +23,7 @@ from password_manager import (
     generate_totp_code,
     get_password_strength_feedback,
     normalize_recovery_code,
+    normalize_tags,
     sort_credentials,
     validate_imported_db,
 )
@@ -645,6 +649,345 @@ class TestValidateImportedDb:
         }
         is_valid, _ = validate_imported_db(data)
         assert not is_valid
+
+    def test_entry_without_type_field_is_treated_as_login(self):
+        data = {"GitHub": {"username": "user", "password_criptata": "enc"}}
+        is_valid, _ = validate_imported_db(data)
+        assert is_valid
+
+    def test_explicit_login_type_is_valid(self):
+        data = {"GitHub": {"type": "login", "username": "user", "password_criptata": "enc"}}
+        is_valid, _ = validate_imported_db(data)
+        assert is_valid
+
+    def test_unknown_type_fails(self):
+        data = {"Mystery": {"type": "not-a-real-type", "content_criptato": "enc"}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+    def test_valid_note_passes(self):
+        data = {"My Note": {"type": "note", "content_criptato": "enc"}}
+        is_valid, error = validate_imported_db(data)
+        assert is_valid, error
+
+    def test_note_missing_content_fails(self):
+        data = {"My Note": {"type": "note"}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+    def test_note_with_wrong_content_type_fails(self):
+        data = {"My Note": {"type": "note", "content_criptato": 123}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+    def test_valid_card_passes(self):
+        data = {
+            "My Visa": {
+                "type": "card",
+                "card_number_criptato": "enc-number",
+                "cardholder_criptato": "enc-holder",
+                "expiry_criptato": "enc-expiry",
+                "cvv_criptato": "enc-cvv",
+            },
+        }
+        is_valid, error = validate_imported_db(data)
+        assert is_valid, error
+
+    def test_card_missing_number_fails(self):
+        data = {"My Visa": {"type": "card", "cardholder_criptato": "enc"}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+    def test_card_with_wrong_field_type_fails(self):
+        data = {"My Visa": {"type": "card", "card_number_criptato": "enc", "cvv_criptato": 123}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+    def test_card_with_only_required_field_passes(self):
+        # cardholder/expiry/cvv sono opzionali: una carta può essere salvata
+        # con solo il numero (stesso principio del TOTP opzionale sui login).
+        data = {"My Visa": {"type": "card", "card_number_criptato": "enc"}}
+        is_valid, error = validate_imported_db(data)
+        assert is_valid, error
+
+    def test_valid_tags_pass(self):
+        data = {"GitHub": {"username": "user", "password_criptata": "enc", "tags": ["work", "dev"]}}
+        is_valid, error = validate_imported_db(data)
+        assert is_valid, error
+
+    def test_tags_wrong_type_fails(self):
+        data = {"GitHub": {"username": "user", "password_criptata": "enc", "tags": "not-a-list"}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+    def test_tags_with_non_string_entries_fails(self):
+        data = {"GitHub": {"username": "user", "password_criptata": "enc", "tags": ["ok", 123]}}
+        is_valid, _ = validate_imported_db(data)
+        assert not is_valid
+
+
+class TestNormalizeTags:
+    def test_strips_whitespace(self):
+        assert normalize_tags([" work ", "dev "]) == ["work", "dev"]
+
+    def test_drops_empty_and_blank_entries(self):
+        assert normalize_tags(["work", "", "   "]) == ["work"]
+
+    def test_deduplicates_preserving_first_occurrence_order(self):
+        assert normalize_tags(["b", "a", "b", "a"]) == ["b", "a"]
+
+    def test_drops_non_string_entries(self):
+        assert normalize_tags(["work", 123, None]) == ["work"]
+
+    def test_none_returns_empty_list(self):
+        assert normalize_tags(None) == []
+
+    def test_empty_list_returns_empty_list(self):
+        assert normalize_tags([]) == []
+
+
+class TestLoginTags:
+    def test_add_credential_with_tags(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2", tags=["work", "dev"])
+
+        items = manager.get_decrypted_items()
+        github = next(i for i in items if i["key"] == "GitHub")
+        assert github["tags"] == ["work", "dev"]
+        assert github["type"] == ITEM_TYPE_LOGIN
+
+    def test_add_credential_without_tags_defaults_to_empty(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "octocat@example.com", "hunter2")
+
+        items = manager.get_decrypted_items()
+        github = next(i for i in items if i["key"] == "GitHub")
+        assert github["tags"] == []
+
+    def test_update_credential_with_explicit_tags_replaces_them(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "a", "pw1", tags=["work"])
+        manager.update_credential("GitHub", "b", "pw2", tags=["personal"])
+
+        items = manager.get_decrypted_items()
+        github = next(i for i in items if i["key"] == "GitHub")
+        assert github["tags"] == ["personal"]
+
+    def test_update_credential_without_tags_preserves_existing(self, manager):
+        # Streamlit chiama update_credential/add_credential senza mai passare
+        # `tags`: questo comportamento garantisce che modificare una
+        # credenziale da Streamlit non cancelli i tag assegnati dalla webapp
+        # React.
+        unlock(manager)
+        manager.add_credential("GitHub", "a", "pw1", tags=["work", "dev"])
+        manager.update_credential("GitHub", "b", "pw2")
+
+        items = manager.get_decrypted_items()
+        github = next(i for i in items if i["key"] == "GitHub")
+        assert github["tags"] == ["work", "dev"]
+        assert github["username"] == "b"
+        assert github["password"] == "pw2"
+
+    def test_tags_are_normalized_on_save(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "a", "pw1", tags=[" work ", "work", ""])
+
+        items = manager.get_decrypted_items()
+        github = next(i for i in items if i["key"] == "GitHub")
+        assert github["tags"] == ["work"]
+
+    def test_get_decrypted_passwords_does_not_expose_tags_or_type(self, manager):
+        # get_decrypted_passwords() deve restituire ESATTAMENTE lo stesso
+        # shape di sempre per non introdurre differenze osservabili in
+        # Streamlit: niente 'tags' né 'type' nell'output decriptato.
+        unlock(manager)
+        manager.add_credential("GitHub", "a", "pw1", tags=["work"])
+
+        decrypted = manager.get_decrypted_passwords()
+        assert set(decrypted["GitHub"].keys()) == {"username", "password", "last_updated", "totp_secret"}
+
+
+class TestSecureNotes:
+    def test_add_and_decrypt_note(self, manager):
+        unlock(manager)
+        assert manager.add_note("Wifi Casa", "SSID: home\nPassword: supersegreta") is True
+
+        items = manager.get_decrypted_items()
+        note = next(i for i in items if i["key"] == "Wifi Casa")
+        assert note["type"] == ITEM_TYPE_NOTE
+        assert note["content"] == "SSID: home\nPassword: supersegreta"
+        assert note["tags"] == []
+
+    def test_add_note_with_tags(self, manager):
+        unlock(manager)
+        manager.add_note("Wifi Casa", "contenuto", tags=["casa", "rete"])
+
+        items = manager.get_decrypted_items()
+        note = next(i for i in items if i["key"] == "Wifi Casa")
+        assert note["tags"] == ["casa", "rete"]
+
+    def test_update_note_overwrites_content(self, manager):
+        unlock(manager)
+        manager.add_note("Nota", "vecchio contenuto")
+        manager.update_note("Nota", "nuovo contenuto")
+
+        items = manager.get_decrypted_items()
+        note = next(i for i in items if i["key"] == "Nota")
+        assert note["content"] == "nuovo contenuto"
+
+    def test_update_note_without_tags_preserves_existing(self, manager):
+        unlock(manager)
+        manager.add_note("Nota", "contenuto", tags=["personale"])
+        manager.update_note("Nota", "contenuto aggiornato")
+
+        items = manager.get_decrypted_items()
+        note = next(i for i in items if i["key"] == "Nota")
+        assert note["tags"] == ["personale"]
+
+    def test_delete_note_via_delete_credential(self, manager):
+        unlock(manager)
+        manager.add_note("Nota", "contenuto")
+        manager.delete_credential("Nota")
+
+        assert manager.get_decrypted_items() == []
+
+    def test_add_note_without_cipher_fails(self, manager):
+        assert manager.add_note("Nota", "contenuto") is False
+
+    def test_note_is_not_returned_by_get_decrypted_passwords(self, manager):
+        unlock(manager)
+        manager.add_note("Nota", "contenuto")
+        manager.add_credential("GitHub", "a", "pw1")
+
+        decrypted = manager.get_decrypted_passwords()
+        assert "Nota" not in decrypted
+        assert "GitHub" in decrypted
+
+
+class TestPaymentCards:
+    def test_add_and_decrypt_card(self, manager):
+        unlock(manager)
+        assert manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123") is True
+
+        items = manager.get_decrypted_items()
+        card = next(i for i in items if i["key"] == "Carta Visa")
+        assert card["type"] == ITEM_TYPE_CARD
+        assert card["cardholder"] == "Mario Rossi"
+        assert card["card_number"] == "4111111111111111"
+        assert card["expiry"] == "12/29"
+        assert card["cvv"] == "123"
+        assert card["tags"] == []
+
+    def test_add_card_with_tags(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123", tags=["personale"])
+
+        items = manager.get_decrypted_items()
+        card = next(i for i in items if i["key"] == "Carta Visa")
+        assert card["tags"] == ["personale"]
+
+    def test_add_card_with_optional_fields_empty(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Solo Numero", "", "4111111111111111", "", "")
+
+        items = manager.get_decrypted_items()
+        card = next(i for i in items if i["key"] == "Carta Solo Numero")
+        assert card["card_number"] == "4111111111111111"
+        assert card["cardholder"] == ""
+        assert card["expiry"] == ""
+        assert card["cvv"] == ""
+
+    def test_card_fields_are_encrypted_separately_on_disk(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123")
+
+        raw = manager.load_encrypted_db()["Carta Visa"]
+        assert raw["card_number_criptato"] != "4111111111111111"
+        assert raw["cardholder_criptato"] != "Mario Rossi"
+        assert raw["expiry_criptato"] != "12/29"
+        assert raw["cvv_criptato"] != "123"
+        assert raw["card_number_criptato"] != raw["cvv_criptato"]
+
+    def test_update_card_overwrites_fields(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123")
+        manager.update_card("Carta Visa", "Luigi Verdi", "5555555555554444", "01/30", "999")
+
+        items = manager.get_decrypted_items()
+        card = next(i for i in items if i["key"] == "Carta Visa")
+        assert card["cardholder"] == "Luigi Verdi"
+        assert card["card_number"] == "5555555555554444"
+
+    def test_update_card_without_tags_preserves_existing(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123", tags=["personale"])
+        manager.update_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/30", "123")
+
+        items = manager.get_decrypted_items()
+        card = next(i for i in items if i["key"] == "Carta Visa")
+        assert card["tags"] == ["personale"]
+
+    def test_delete_card_via_delete_credential(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123")
+        manager.delete_credential("Carta Visa")
+
+        assert manager.get_decrypted_items() == []
+
+    def test_add_card_without_cipher_fails(self, manager):
+        assert manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123") is False
+
+    def test_card_is_not_returned_by_get_decrypted_passwords(self, manager):
+        unlock(manager)
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123")
+
+        decrypted = manager.get_decrypted_passwords()
+        assert decrypted == {}
+
+
+class TestGetDecryptedItems:
+    def test_without_cipher_returns_none(self, manager):
+        assert manager.get_decrypted_items() is None
+
+    def test_empty_vault_returns_empty_list(self, manager):
+        unlock(manager)
+        assert manager.get_decrypted_items() == []
+
+    def test_mixed_vault_returns_all_types(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "octocat", "hunter2", tags=["dev"])
+        manager.add_note("Nota", "contenuto segreto", tags=["personale"])
+        manager.add_card("Carta Visa", "Mario Rossi", "4111111111111111", "12/29", "123", tags=["personale"])
+
+        items = manager.get_decrypted_items()
+        assert len(items) == 3
+        by_key = {item["key"]: item for item in items}
+        assert by_key["GitHub"]["type"] == ITEM_TYPE_LOGIN
+        assert by_key["Nota"]["type"] == ITEM_TYPE_NOTE
+        assert by_key["Carta Visa"]["type"] == ITEM_TYPE_CARD
+
+    def test_legacy_login_entry_without_type_field_is_reported_as_login(self, manager):
+        unlock(manager)
+        manager.add_credential("GitHub", "octocat", "hunter2")
+        db = manager.load_encrypted_db()
+        del db["GitHub"]["type"]
+        manager.save_encrypted_db(db)
+
+        items = manager.get_decrypted_items()
+        github = next(i for i in items if i["key"] == "GitHub")
+        assert github["type"] == ITEM_TYPE_LOGIN
+        assert github["password"] == "hunter2"
+
+    def test_corrupted_entry_reports_decryption_error_without_crashing(self, manager):
+        unlock(manager)
+        manager.add_note("Nota", "contenuto")
+        db = manager.load_encrypted_db()
+        db["Nota"]["content_criptato"] = "not-a-valid-fernet-token"
+        manager.save_encrypted_db(db)
+
+        items = manager.get_decrypted_items()
+        note = next(i for i in items if i["key"] == "Nota")
+        assert note["error"] == "ERRORE DI DECRIPTAZIONE"
 
 
 class TestSortCredentials:

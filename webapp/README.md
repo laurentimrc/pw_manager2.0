@@ -24,9 +24,11 @@ webapp/
         ├── lib/api.ts                 client HTTP verso il backend (fetch, credentials: 'include')
         ├── components/auth/           Setup, Login, reveal codice di recovery, flusso "password dimenticata"
         ├── components/credentials/    lista, form aggiunta/modifica, generatore, TOTP, copia rapida
+        ├── components/notes/          Note Sicure: lista, form aggiunta/modifica, eliminazione (solo webapp)
+        ├── components/cards/          Carte di Pagamento: lista, form aggiunta/modifica, eliminazione (solo webapp)
         ├── components/dashboard/      Dashboard di Sicurezza
         ├── components/utility/        Export / Import / Cambio Master Password
-        └── components/ui/             primitive riutilizzabili (Button, Card, Badge, Tabs, ...)
+        └── components/ui/             primitive riutilizzabili (Button, Card, Badge, Tabs, TagInput, TagFilterBar, ...)
 ```
 
 ### Perché FastAPI + React invece di estendere Streamlit
@@ -53,6 +55,15 @@ Tutta la logica vive in `password_manager.py` (condivisa con Streamlit), il back
   1. `POST /api/auth/recover/verify` — verifica il codice contro l'hash bcrypt salvato, senza toccare la DEK: dà un errore chiaro e immediato ("codice non valido") prima ancora di far scegliere una nuova master password.
   2. `POST /api/auth/recover` — codice + nuova master password: sblocca la DEK con la KEK di recovery, ri-avvolge la DEK con la nuova KEK master, e genera/salva un **nuovo** codice di recovery (quello usato è a uso singolo e da questo momento non è più valido). Nessuna sessione viene creata da questa chiamata: l'utente torna alla schermata di login e accede con la nuova master password.
 - `change_master_password` non ri-cripta più ogni singola credenziale: si limita a ri-avvolgere la DEK esistente con la nuova KEK master (la DEK stessa non cambia). Il codice di recovery non viene ruotato da un cambio "volontario" della master password, solo da un uso effettivo del recovery.
+
+### Vault unificato: login, note sicure, carte di pagamento, tag (solo webapp)
+
+Il vault (`passwords.json`) non contiene più solo login: ogni voce ha un campo `type` (`"login"` | `"note"` | `"card"`, assente = `"login"` per le voci esistenti create prima di questa funzionalità) e un campo `tags` (lista di stringhe, universale a tutti i tipi). Non ci sono file o chiavi separate per tipo: note e carte condividono lo stesso `passwords.json` e la stessa DEK Fernet dei login, con lo stesso pattern di cifratura per singolo campo già usato per `password_criptata`/`totp_secret_criptato`:
+
+- **Note sicure** (`type: "note"`): un campo `content_criptato` (testo libero cifrato).
+- **Carte di pagamento** (`type: "card"`): `card_number_criptato`, `cardholder_criptato`, `expiry_criptato`, `cvv_criptato` — cifrati separatamente, non un blob unico. Solo numero carta e CVV sono mascherati in interfaccia (dietro un toggle "Mostra"); intestatario e scadenza compaiono già nell'elenco, come lo username per i login.
+
+Tutta la logica vive in `password_manager.py` (`add_note`/`update_note`, `add_card`/`update_card`, `get_decrypted_items` per leggere l'intero vault decriptato). `get_decrypted_passwords()` — usata da Streamlit e dall'elenco credenziali della webapp — continua a restituire **solo** le voci di tipo login, esattamente come prima: Streamlit non vede né note né carte, e non ha bisogno di modifiche per continuare a funzionare invariato. Il backend espone `GET/POST /api/notes`, `GET/POST /api/cards`, `PUT /api/notes/{key}` e `PUT /api/cards/{key}`; l'eliminazione riusa lo stesso `DELETE /api/credentials/{service}` generico per chiave (il metodo `delete_credential` non distingue per tipo). `GET /api/tags` restituisce l'elenco dei tag distinti usati nel vault (login + note + carte), usato per il filtro e per i suggerimenti di autocompletamento nei form.
 
 ### Controllo violazioni note (solo webapp)
 

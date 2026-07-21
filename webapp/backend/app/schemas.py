@@ -33,12 +33,42 @@ class AddCredentialRequest(BaseModel):
     username: str
     password: str
     totp_secret: str = ""
+    tags: List[str] = Field(default_factory=list)
 
 
 class UpdateCredentialRequest(BaseModel):
     username: str
     password: str
     totp_secret: str = ""
+    tags: List[str] = Field(default_factory=list)
+
+
+class AddNoteRequest(BaseModel):
+    title: str
+    content: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class UpdateNoteRequest(BaseModel):
+    content: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class AddCardRequest(BaseModel):
+    name: str
+    cardholder: str = ""
+    card_number: str
+    expiry: str = ""
+    cvv: str = ""
+    tags: List[str] = Field(default_factory=list)
+
+
+class UpdateCardRequest(BaseModel):
+    cardholder: str = ""
+    card_number: str
+    expiry: str = ""
+    cvv: str = ""
+    tags: List[str] = Field(default_factory=list)
 
 
 class ImportRequest(BaseModel):
