@@ -2,6 +2,8 @@ import { useRef, useState } from 'react'
 import { Sidebar, type View } from '@/components/layout/Sidebar'
 import { CredentialList } from '@/components/credentials/CredentialList'
 import { AddCredentialForm } from '@/components/credentials/AddCredentialForm'
+import { NotesPage } from '@/components/notes/NotesPage'
+import { CardsPage } from '@/components/cards/CardsPage'
 import { SecurityDashboard } from '@/components/dashboard/SecurityDashboard'
 import { UtilityPage } from '@/components/utility/UtilityPage'
 import { useParallaxWash } from '@/hooks/useParallaxWash'
@@ -36,6 +38,8 @@ export function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
               }}
             />
           )}
+          {view === 'notes' && <NotesPage />}
+          {view === 'cards' && <CardsPage />}
           {view === 'dashboard' && <SecurityDashboard />}
           {view === 'utility' && <UtilityPage />}
         </div>

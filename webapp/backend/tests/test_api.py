@@ -682,3 +682,268 @@ class TestPasswordHelpers:
         resp = client.post("/api/password-generator", json={"length": 24, "exclude_ambiguous": True})
         assert resp.status_code == 200
         assert len(resp.json()["password"]) == 24
+
+
+class TestCredentialTags:
+    def _authed_client(self, tmp_path) -> TestClient:
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        return client
+
+    def test_add_credential_with_tags_exposes_them_in_list_and_secret(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa", "tags": ["work", "dev"],
+        })
+
+        items = client.get("/api/credentials").json()["items"]
+        assert items[0]["tags"] == ["work", "dev"]
+
+        secret = client.get("/api/credentials/GitHub/secret").json()
+        assert secret["tags"] == ["work", "dev"]
+
+    def test_update_credential_replaces_tags(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa", "tags": ["work"],
+        })
+        client.put("/api/credentials/GitHub", json={"username": "a", "password": "bbbbbbbbbbbb", "tags": ["personal"]})
+
+        secret = client.get("/api/credentials/GitHub/secret").json()
+        assert secret["tags"] == ["personal"]
+
+    def test_filter_credentials_by_tag(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa", "tags": ["work"],
+        })
+        client.post("/api/credentials", json={
+            "service": "Netflix", "username": "b", "password": "bbbbbbbbbbbb", "tags": ["personal"],
+        })
+
+        resp = client.get("/api/credentials", params={"tag": "work"})
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["service"] == "GitHub"
+
+    def test_list_tags_returns_distinct_tags_across_item_types(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa", "tags": ["work"],
+        })
+        client.post("/api/notes", json={"title": "Nota", "content": "segreto", "tags": ["personal"]})
+        client.post("/api/cards", json={"name": "Visa", "card_number": "4111111111111111", "tags": ["work"]})
+
+        resp = client.get("/api/tags")
+        assert resp.status_code == 200
+        assert resp.json()["tags"] == ["personal", "work"]
+
+    def test_list_tags_requires_authentication(self, tmp_path):
+        client = make_client(tmp_path)
+        resp = client.get("/api/tags")
+        assert resp.status_code == 401
+
+
+class TestSecureNotesCrud:
+    def _authed_client(self, tmp_path) -> TestClient:
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        return client
+
+    def test_add_list_and_get_secret(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.post("/api/notes", json={"title": "Wifi Casa", "content": "SSID: home", "tags": ["casa"]})
+        assert resp.status_code == 201
+
+        resp = client.get("/api/notes")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["key"] == "Wifi Casa"
+        assert items[0]["tags"] == ["casa"]
+        assert "content" not in items[0]
+
+        secret = client.get("/api/notes/Wifi Casa/secret")
+        assert secret.status_code == 200
+        assert secret.json()["content"] == "SSID: home"
+
+    def test_notes_are_not_listed_among_credentials(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/notes", json={"title": "Nota", "content": "segreto"})
+        client.post("/api/credentials", json={"service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa"})
+
+        items = client.get("/api/credentials").json()["items"]
+        assert len(items) == 1
+        assert items[0]["service"] == "GitHub"
+
+    def test_add_note_requires_title_and_content(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.post("/api/notes", json={"title": "", "content": "x"})
+        assert resp.status_code == 400
+        resp = client.post("/api/notes", json={"title": "Nota", "content": ""})
+        assert resp.status_code == 400
+
+    def test_add_duplicate_note_title_fails(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/notes", json={"title": "Nota", "content": "primo"})
+        resp = client.post("/api/notes", json={"title": "Nota", "content": "secondo"})
+        assert resp.status_code == 409
+
+    def test_note_name_cannot_collide_with_existing_credential(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/credentials", json={"service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa"})
+        resp = client.post("/api/notes", json={"title": "GitHub", "content": "x"})
+        assert resp.status_code == 409
+
+    def test_update_note(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/notes", json={"title": "Nota", "content": "vecchio"})
+        resp = client.put("/api/notes/Nota", json={"content": "nuovo", "tags": ["aggiornata"]})
+        assert resp.status_code == 200
+
+        secret = client.get("/api/notes/Nota/secret").json()
+        assert secret["content"] == "nuovo"
+        assert secret["tags"] == ["aggiornata"]
+
+    def test_update_nonexistent_note_fails(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.put("/api/notes/DoesNotExist", json={"content": "x"})
+        assert resp.status_code == 404
+
+    def test_delete_note_reuses_generic_credentials_delete_endpoint(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/notes", json={"title": "Nota", "content": "x"})
+        resp = client.delete("/api/credentials/Nota")
+        assert resp.status_code == 200
+        assert client.get("/api/notes").json()["items"] == []
+
+    def test_search_filters_notes_by_title(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/notes", json={"title": "Wifi Casa", "content": "x"})
+        client.post("/api/notes", json={"title": "Codici Backup", "content": "y"})
+        resp = client.get("/api/notes", params={"search": "wifi"})
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["key"] == "Wifi Casa"
+
+    def test_notes_require_authentication(self, tmp_path):
+        client = make_client(tmp_path)
+        assert client.get("/api/notes").status_code == 401
+        assert client.post("/api/notes", json={"title": "x", "content": "y"}).status_code == 401
+
+
+class TestPaymentCardsCrud:
+    def _authed_client(self, tmp_path) -> TestClient:
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        return client
+
+    def test_add_list_and_get_secret(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.post("/api/cards", json={
+            "name": "Carta Visa", "cardholder": "Mario Rossi", "card_number": "4111111111111111",
+            "expiry": "12/29", "cvv": "123", "tags": ["personale"],
+        })
+        assert resp.status_code == 201
+
+        items = client.get("/api/cards").json()["items"]
+        assert len(items) == 1
+        assert items[0]["key"] == "Carta Visa"
+        assert items[0]["card_number_last4"] == "1111"
+        assert items[0]["tags"] == ["personale"]
+        assert "card_number" not in items[0]
+
+        secret = client.get("/api/cards/Carta Visa/secret")
+        assert secret.status_code == 200
+        body = secret.json()
+        assert body["card_number"] == "4111111111111111"
+        assert body["cardholder"] == "Mario Rossi"
+        assert body["cvv"] == "123"
+
+    def test_add_card_requires_name_and_number(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.post("/api/cards", json={"name": "", "card_number": "4111111111111111"})
+        assert resp.status_code == 400
+        resp = client.post("/api/cards", json={"name": "Carta", "card_number": ""})
+        assert resp.status_code == 400
+
+    def test_add_card_optional_fields_can_be_omitted(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.post("/api/cards", json={"name": "Carta Solo Numero", "card_number": "4111111111111111"})
+        assert resp.status_code == 201
+        secret = client.get("/api/cards/Carta Solo Numero/secret").json()
+        assert secret["card_number"] == "4111111111111111"
+        assert secret["cardholder"] == ""
+
+    def test_add_duplicate_card_name_fails(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/cards", json={"name": "Carta", "card_number": "4111111111111111"})
+        resp = client.post("/api/cards", json={"name": "Carta", "card_number": "5555555555554444"})
+        assert resp.status_code == 409
+
+    def test_update_card(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/cards", json={"name": "Carta", "card_number": "4111111111111111"})
+        resp = client.put("/api/cards/Carta", json={
+            "cardholder": "Luigi Verdi", "card_number": "5555555555554444", "expiry": "01/30", "cvv": "999",
+        })
+        assert resp.status_code == 200
+
+        secret = client.get("/api/cards/Carta/secret").json()
+        assert secret["card_number"] == "5555555555554444"
+        assert secret["cardholder"] == "Luigi Verdi"
+
+    def test_update_nonexistent_card_fails(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        resp = client.put("/api/cards/DoesNotExist", json={"card_number": "4111111111111111"})
+        assert resp.status_code == 404
+
+    def test_delete_card_reuses_generic_credentials_delete_endpoint(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/cards", json={"name": "Carta", "card_number": "4111111111111111"})
+        resp = client.delete("/api/credentials/Carta")
+        assert resp.status_code == 200
+        assert client.get("/api/cards").json()["items"] == []
+
+    def test_filter_cards_by_tag(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/cards", json={"name": "Visa", "card_number": "4111111111111111", "tags": ["lavoro"]})
+        client.post("/api/cards", json={"name": "Mastercard", "card_number": "5555555555554444", "tags": ["personale"]})
+        resp = client.get("/api/cards", params={"tag": "lavoro"})
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["key"] == "Visa"
+
+    def test_cards_require_authentication(self, tmp_path):
+        client = make_client(tmp_path)
+        assert client.get("/api/cards").status_code == 401
+        assert client.post("/api/cards", json={"name": "x", "card_number": "4111111111111111"}).status_code == 401
+
+
+class TestBackupIncludesAllItemTypes:
+    def _authed_client(self, tmp_path) -> TestClient:
+        client = make_client(tmp_path)
+        setup_and_login(client)
+        return client
+
+    def test_export_and_reimport_roundtrips_all_item_types(self, tmp_path):
+        client = self._authed_client(tmp_path)
+        client.post("/api/credentials", json={
+            "service": "GitHub", "username": "a", "password": "aaaaaaaaaaaa", "tags": ["work"],
+        })
+        client.post("/api/notes", json={"title": "Nota", "content": "segreto", "tags": ["personale"]})
+        client.post("/api/cards", json={
+            "name": "Carta", "cardholder": "Mario Rossi", "card_number": "4111111111111111",
+            "expiry": "12/29", "cvv": "123", "tags": ["lavoro"],
+        })
+
+        exported = client.get("/api/utility/export").json()
+        assert len(exported) == 3
+
+        resp = client.post("/api/utility/import", json={"data": exported, "confirm": True})
+        assert resp.status_code == 200
+        assert resp.json()["imported_entries"] == 3
+
+        assert client.get("/api/credentials/GitHub/secret").json()["password"] == "aaaaaaaaaaaa"
+        assert client.get("/api/notes/Nota/secret").json()["content"] == "segreto"
+        assert client.get("/api/cards/Carta/secret").json()["card_number"] == "4111111111111111"

@@ -4,7 +4,9 @@ import { Input } from '@/components/ui/Input'
 import { Label } from '@/components/ui/Label'
 import { Button } from '@/components/ui/Button'
 import { Alert } from '@/components/ui/Alert'
+import { TagInput } from '@/components/ui/TagInput'
 import { PasswordStrengthMeter } from '@/components/credentials/PasswordStrengthMeter'
+import { useTags } from '@/hooks/useTags'
 
 export function EditCredentialForm({
   service,
@@ -19,8 +21,10 @@ export function EditCredentialForm({
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [totpSecret, setTotpSecret] = useState('')
+  const [tags, setTags] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const availableTags = useTags()
 
   useEffect(() => {
     let cancelled = false
@@ -32,6 +36,7 @@ export function EditCredentialForm({
         setUsername(secret.username)
         setPassword(secret.password)
         setTotpSecret(secret.totp_secret)
+        setTags(secret.tags)
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof ApiError ? err.message : 'Errore nel caricamento della credenziale.')
@@ -49,7 +54,7 @@ export function EditCredentialForm({
     setError(null)
     setSubmitting(true)
     try {
-      await api.updateCredential(service, username, password, totpSecret)
+      await api.updateCredential(service, username, password, totpSecret, tags)
       onSaved()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Errore durante il salvataggio.')
@@ -87,6 +92,10 @@ export function EditCredentialForm({
           onChange={(e) => setTotpSecret(e.target.value)}
           placeholder="Lascia vuoto per rimuovere"
         />
+      </div>
+      <div className="flex flex-col gap-1.5">
+        <Label htmlFor={`edit-tags-${service}`}>Tag</Label>
+        <TagInput id={`edit-tags-${service}`} tags={tags} onChange={setTags} suggestions={availableTags} />
       </div>
       {error && <Alert variant="destructive">{error}</Alert>}
       <div className="flex gap-2">

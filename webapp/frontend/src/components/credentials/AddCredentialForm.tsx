@@ -5,8 +5,10 @@ import { Input } from '@/components/ui/Input'
 import { Label } from '@/components/ui/Label'
 import { Button } from '@/components/ui/Button'
 import { Alert } from '@/components/ui/Alert'
+import { TagInput } from '@/components/ui/TagInput'
 import { PasswordStrengthMeter } from '@/components/credentials/PasswordStrengthMeter'
 import { PasswordGeneratorPanel } from '@/components/credentials/PasswordGeneratorPanel'
+import { useTags } from '@/hooks/useTags'
 import { api, ApiError } from '@/lib/api'
 
 export function AddCredentialForm({ onAdded }: { onAdded: () => void }) {
@@ -15,9 +17,11 @@ export function AddCredentialForm({ onAdded }: { onAdded: () => void }) {
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [totpSecret, setTotpSecret] = useState('')
+  const [tags, setTags] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const availableTags = useTags()
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()
@@ -31,12 +35,13 @@ export function AddCredentialForm({ onAdded }: { onAdded: () => void }) {
 
     setSubmitting(true)
     try {
-      await api.addCredential(service, username, password, totpSecret)
+      await api.addCredential(service, username, password, totpSecret, tags)
       setSuccess(`Credenziale per '${service}' aggiunta!`)
       setService('')
       setUsername('')
       setPassword('')
       setTotpSecret('')
+      setTags([])
       onAdded()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Errore durante il salvataggio.')
@@ -97,6 +102,10 @@ export function AddCredentialForm({ onAdded }: { onAdded: () => void }) {
                 onChange={(e) => setTotpSecret(e.target.value)}
                 placeholder="Chiave segreta 2FA fornita dal servizio"
               />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="add-tags">Tag</Label>
+              <TagInput id="add-tags" tags={tags} onChange={setTags} suggestions={availableTags} />
             </div>
             {error && <Alert variant="destructive">{error}</Alert>}
             {success && <Alert variant="success">{success}</Alert>}

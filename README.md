@@ -43,6 +43,10 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
 * **Indicatore di Robustezza della Password:**
     * Feedback in tempo reale (testo e barra colorata) sulla robustezza della password mentre viene digitata (nel form di aggiunta, modifica e durante il setup della master password) utilizzando la libreria `zxcvbn-python`.
     * Indicazione della robustezza anche per le password generate.
+* **Note Sicure e Carte di Pagamento, con Tag (solo webapp React):**
+    * Oltre ai login, il vault può contenere note sicure (testo libero cifrato) e carte di pagamento (numero, intestatario, scadenza, CVV, cifrati singolarmente). Ogni voce — login, nota o carta — può avere una lista di tag liberi, con filtro per tag nelle rispettive liste.
+    * Numero carta e CVV sono mascherati di default con toggle mostra/nascondi, come le password.
+    * **Disponibile solo nella webapp React** (vedi sotto): l'interfaccia Streamlit continua a mostrare solo i login, esattamente come prima. Backup/export/import includono comunque tutte le voci del vault, di qualunque tipo.
 * **Import/Export del Database Password:**
     * **Esportazione:** Possibilità di scaricare un backup dell'intero database di password (le password rimangono criptate nel file esportato) in formato JSON.
     * **Importazione:** Caricamento di un file di backup JSON con validazione della struttura e conferma esplicita prima di sovrascrivere il database esistente.
@@ -117,6 +121,6 @@ pytest tests/
 
 Oltre all'interfaccia Streamlit, il progetto include una **seconda interfaccia**, opzionale e indipendente, nella cartella [`webapp/`](webapp/): un frontend React/TypeScript con look moderno (Tailwind, componenti in stile shadcn/ui) e un backend FastAPI, entrambi pensati per uso locale (il backend ascolta solo su `127.0.0.1`).
 
-Le due interfacce operano sullo **stesso vault** (`passwords.json`, `master_pwd.hash`, `kdf.salt`, `vault_key.json` nella radice del repository): riusano entrambe `password_manager.py` senza duplicare la logica di dominio. Puoi usare l'una o l'altra indifferentemente (non contemporaneamente sullo stesso file di lock del processo, ma sugli stessi dati). Le due interfacce sono equivalenti per setup/login/gestione credenziali/cambio master password; il **recovery della master password dimenticata** (via codice di recovery) e il **controllo violazioni note (HIBP)** sono invece disponibili solo nella webapp React, che espone le relative UI — la logica di dominio sottostante è comunque condivisa, quindi un vault gestito con l'una resta pienamente compatibile con l'altra.
+Le due interfacce operano sullo **stesso vault** (`passwords.json`, `master_pwd.hash`, `kdf.salt`, `vault_key.json` nella radice del repository): riusano entrambe `password_manager.py` senza duplicare la logica di dominio. Puoi usare l'una o l'altra indifferentemente (non contemporaneamente sullo stesso file di lock del processo, ma sugli stessi dati). Le due interfacce sono equivalenti per setup/login/gestione credenziali/cambio master password; il **recovery della master password dimenticata** (via codice di recovery), il **controllo violazioni note (HIBP)** e la gestione di **note sicure, carte di pagamento e tag** sono invece disponibili solo nella webapp React, che espone le relative UI — la logica di dominio sottostante è comunque condivisa (stesso `passwords.json`, stessa DEK), quindi un vault con note/carte/tag creato dalla webapp resta leggibile da Streamlit, che però continua a mostrare solo i login, ignorando silenziosamente le altre voci.
 
 Per l'avvio e i dettagli architetturali vedi [`webapp/README.md`](webapp/README.md).

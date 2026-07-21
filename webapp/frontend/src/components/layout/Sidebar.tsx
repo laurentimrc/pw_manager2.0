@@ -1,14 +1,16 @@
-import { KeyRound, LayoutList, Lock, PlusCircle, Settings, ShieldCheck } from 'lucide-react'
+import { CreditCard, KeyRound, LayoutList, Lock, PlusCircle, Settings, ShieldCheck, StickyNote } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { ThemeToggle } from '@/components/layout/ThemeToggle'
 import { useSlidingIndicator } from '@/hooks/useSlidingIndicator'
 import { cn } from '@/lib/cn'
 
-export type View = 'list' | 'add' | 'dashboard' | 'utility'
+export type View = 'list' | 'add' | 'notes' | 'cards' | 'dashboard' | 'utility'
 
 const NAV_ITEMS: { view: View; label: string; icon: typeof LayoutList }[] = [
   { view: 'list', label: 'Visualizza / Modifica', icon: LayoutList },
   { view: 'add', label: 'Aggiungi Nuova', icon: PlusCircle },
+  { view: 'notes', label: 'Note Sicure', icon: StickyNote },
+  { view: 'cards', label: 'Carte', icon: CreditCard },
   { view: 'dashboard', label: 'Dashboard Sicurezza', icon: ShieldCheck },
   { view: 'utility', label: 'Utility', icon: Settings },
 ]

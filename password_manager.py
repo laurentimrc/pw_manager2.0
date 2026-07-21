@@ -19,6 +19,15 @@ PBKDF2_ITERATIONS = 600000
 SYMBOLS = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 AMBIGUOUS_CHARACTERS = "Il1O0|'`"
 
+# Tipi di voce del vault. "login" è il default implicito per le voci
+# esistenti create prima dell'introduzione di questo campo (nessun campo
+# `type` salvato su disco): vedi `get_decrypted_passwords`, che continua a
+# esporre solo i login, e `get_decrypted_items`, che espone tutti i tipi.
+ITEM_TYPE_LOGIN = "login"
+ITEM_TYPE_NOTE = "note"
+ITEM_TYPE_CARD = "card"
+VALID_ITEM_TYPES = frozenset({ITEM_TYPE_LOGIN, ITEM_TYPE_NOTE, ITEM_TYPE_CARD})
+
 # Endpoint "Pwned Passwords" di Have I Been Pwned, usato con il modello
 # k-anonymity: si contatta solo con il prefisso a 5 caratteri esadecimali
 # dell'hash SHA-1 della password (vedi `check_password_breach`).
@@ -334,13 +343,30 @@ class PasswordManager:
         with _open_for_restricted_write(self.db_file, "w") as f:
             json.dump(data, f, indent=4)
 
+    def _decrypt_field(self, entry: Dict[str, Any], field: str) -> str:
+        """Decripta un singolo campo cifrato di una voce del vault (stesso
+        pattern usato per `password_criptata`/`totp_secret_criptato`),
+        restituendo stringa vuota se il campo è assente o vuoto."""
+        value = entry.get(field)
+        if not value:
+            return ""
+        return self.cipher_suite.decrypt(value.encode()).decode()
+
     def get_decrypted_passwords(self) -> Optional[Dict[str, Dict[str, str]]]:
+        """Restituisce SOLO le voci di tipo login (quelle senza campo `type`,
+        cioè create prima dell'introduzione di note/carte, sono trattate come
+        login per retrocompatibilità). Usato da Streamlit e dal frontend
+        React per la vista "credenziali": entrambi devono continuare a vedere
+        esattamente questo sottoinsieme del vault. Per TUTTE le voci (login +
+        note + carte) vedi `get_decrypted_items`."""
         if not self.cipher_suite:
             return None
 
         encrypted_db = self.load_encrypted_db()
         decrypted_data = {}
         for service, credentials in encrypted_db.items():
+            if credentials.get("type", ITEM_TYPE_LOGIN) != ITEM_TYPE_LOGIN:
+                continue
             try:
                 decrypted_password = self.cipher_suite.decrypt(credentials['password_criptata'].encode()).decode()
 
@@ -358,7 +384,16 @@ class PasswordManager:
                 decrypted_data[service] = {"password": "ERRORE DI DECRIPTAZIONE"}
         return decrypted_data
 
-    def add_credential(self, service: str, username: str, password: str, totp_secret: str = "") -> bool:
+    def add_credential(self, service: str, username: str, password: str, totp_secret: str = "",
+                        tags: Optional[List[str]] = None) -> bool:
+        """Aggiunge (o sovrascrive interamente) una voce di tipo login.
+
+        `tags` è un parametro opzionale aggiunto in coda per non alterare la
+        firma richiamabile posizionalmente da `ps_manager_app.py`, che non lo
+        passa mai: se omesso (`None`), i tag di una voce già esistente con lo
+        stesso nome vengono preservati invece di essere azzerati, così che
+        modificare una credenziale da Streamlit non cancelli silenziosamente
+        i tag assegnati dalla webapp React."""
         if not self.cipher_suite:
             return False
 
@@ -369,20 +404,118 @@ class PasswordManager:
             encrypted_totp = self.cipher_suite.encrypt(totp_secret.encode()).decode()
 
         db = self.load_encrypted_db()
+        existing = db.get(service) or {}
+        resolved_tags = tags if tags is not None else existing.get("tags", [])
         db[service] = {
+            "type": ITEM_TYPE_LOGIN,
             "username": username,
             "password_criptata": encrypted_password,
             "last_updated": datetime.now().isoformat(),
             "totp_secret_criptato": encrypted_totp,
+            "tags": normalize_tags(resolved_tags),
         }
         self.save_encrypted_db(db)
         return True
 
     def update_credential(self, service: str, new_username: str, new_password: str,
-                           new_totp_secret: str = "") -> bool:
-        return self.add_credential(service, new_username, new_password, new_totp_secret)
+                           new_totp_secret: str = "", tags: Optional[List[str]] = None) -> bool:
+        return self.add_credential(service, new_username, new_password, new_totp_secret, tags)
+
+    def add_note(self, title: str, content: str, tags: Optional[List[str]] = None) -> bool:
+        """Aggiunge (o sovrascrive interamente) una nota sicura: testo libero
+        cifrato con la stessa DEK usata per le password. `tags` con lo stesso
+        comportamento "preserva se omesso" di `add_credential`."""
+        if not self.cipher_suite:
+            return False
+
+        db = self.load_encrypted_db()
+        existing = db.get(title) or {}
+        resolved_tags = tags if tags is not None else existing.get("tags", [])
+        db[title] = {
+            "type": ITEM_TYPE_NOTE,
+            "content_criptato": self.cipher_suite.encrypt(content.encode()).decode(),
+            "last_updated": datetime.now().isoformat(),
+            "tags": normalize_tags(resolved_tags),
+        }
+        self.save_encrypted_db(db)
+        return True
+
+    def update_note(self, title: str, content: str, tags: Optional[List[str]] = None) -> bool:
+        return self.add_note(title, content, tags)
+
+    def add_card(self, name: str, cardholder: str, card_number: str, expiry: str, cvv: str,
+                 tags: Optional[List[str]] = None) -> bool:
+        """Aggiunge (o sovrascrive interamente) una carta di pagamento: ogni
+        campo sensibile (intestatario, numero, scadenza, CVV) è cifrato
+        singolarmente con la DEK, con lo stesso pattern usato per
+        `password_criptata`/`totp_secret_criptato` - non un unico blob.
+        `tags` con lo stesso comportamento "preserva se omesso" di
+        `add_credential`."""
+        if not self.cipher_suite:
+            return False
+
+        def encrypt_or_empty(value: str) -> str:
+            return self.cipher_suite.encrypt(value.encode()).decode() if value else ""
+
+        db = self.load_encrypted_db()
+        existing = db.get(name) or {}
+        resolved_tags = tags if tags is not None else existing.get("tags", [])
+        db[name] = {
+            "type": ITEM_TYPE_CARD,
+            "cardholder_criptato": encrypt_or_empty(cardholder),
+            "card_number_criptato": encrypt_or_empty(card_number),
+            "expiry_criptato": encrypt_or_empty(expiry),
+            "cvv_criptato": encrypt_or_empty(cvv),
+            "last_updated": datetime.now().isoformat(),
+            "tags": normalize_tags(resolved_tags),
+        }
+        self.save_encrypted_db(db)
+        return True
+
+    def update_card(self, name: str, cardholder: str, card_number: str, expiry: str, cvv: str,
+                     tags: Optional[List[str]] = None) -> bool:
+        return self.add_card(name, cardholder, card_number, expiry, cvv, tags)
+
+    def get_decrypted_items(self) -> Optional[List[Dict[str, Any]]]:
+        """Restituisce TUTTE le voci del vault (login, note, carte) con i
+        campi decifrati appropriati al tipo. Usato SOLO dal backend della
+        webapp React (mai da Streamlit, che resta su `get_decrypted_passwords`
+        per vedere solo i login, esattamente come sempre)."""
+        if not self.cipher_suite:
+            return None
+
+        encrypted_db = self.load_encrypted_db()
+        items: List[Dict[str, Any]] = []
+        for key, entry in encrypted_db.items():
+            item_type = entry.get("type", ITEM_TYPE_LOGIN)
+            base = {
+                "key": key,
+                "type": item_type,
+                "tags": entry.get("tags") or [],
+                "last_updated": entry.get("last_updated"),
+            }
+            try:
+                if item_type == ITEM_TYPE_NOTE:
+                    base["content"] = self._decrypt_field(entry, "content_criptato")
+                elif item_type == ITEM_TYPE_CARD:
+                    base["cardholder"] = self._decrypt_field(entry, "cardholder_criptato")
+                    base["card_number"] = self._decrypt_field(entry, "card_number_criptato")
+                    base["expiry"] = self._decrypt_field(entry, "expiry_criptato")
+                    base["cvv"] = self._decrypt_field(entry, "cvv_criptato")
+                else:
+                    base["type"] = ITEM_TYPE_LOGIN
+                    base["username"] = entry.get("username", "")
+                    base["password"] = self._decrypt_field(entry, "password_criptata")
+                    base["totp_secret"] = self._decrypt_field(entry, "totp_secret_criptato")
+            except Exception:
+                base["error"] = "ERRORE DI DECRIPTAZIONE"
+            items.append(base)
+        return items
 
     def delete_credential(self, service: str) -> None:
+        """Elimina una voce del vault per chiave, indipendentemente dal tipo
+        (login, nota o carta): la cancellazione è generica per costruzione,
+        non serve un metodo dedicato per tipo."""
         db = self.load_encrypted_db()
         if service in db:
             del db[service]
@@ -429,6 +562,23 @@ class PasswordManager:
         self.cipher_suite = Fernet(dek)
 
         return True, "Master Password cambiata con successo!"
+
+
+def normalize_tags(tags: Optional[List[str]]) -> List[str]:
+    """Normalizza una lista di tag prima di salvarla: scarta valori non
+    stringa, rimuove spazi superflui e voci vuote, deduplica preservando
+    l'ordine di prima occorrenza (case-sensitive: "Lavoro" e "lavoro" restano
+    tag distinti, come qualunque altro testo libero in questo modulo)."""
+    if not tags:
+        return []
+    normalized: List[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        cleaned = tag.strip()
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized
 
 
 def generate_recovery_code() -> str:
@@ -573,32 +723,58 @@ def generate_totp_code(secret: str) -> Tuple[Optional[str], int]:
 
 
 def validate_imported_db(data: Any) -> Tuple[bool, str]:
-    """Valida la struttura di un database importato prima di sovrascrivere quello esistente."""
+    """Valida la struttura di un database importato prima di sovrascrivere
+    quello esistente. Copre tutti i tipi di voce del vault (login, note,
+    carte): una voce senza campo `type` è trattata come login, esattamente
+    come al caricamento normale (`get_decrypted_passwords`)."""
     if not isinstance(data, dict):
         return False, "Il file importato deve contenere un oggetto JSON (servizio -> credenziali)."
 
-    for service, credentials in data.items():
-        if not isinstance(service, str) or not service:
-            return False, "Trovato un nome di servizio non valido."
-        if not isinstance(credentials, dict):
-            return False, f"La voce '{service}' non è un oggetto valido."
-        if "username" not in credentials or "password_criptata" not in credentials:
-            return False, f"La voce '{service}' non contiene i campi obbligatori 'username' e 'password_criptata'."
-        if not isinstance(credentials["username"], str) or not isinstance(credentials["password_criptata"], str):
-            return False, f"La voce '{service}' ha campi 'username' o 'password_criptata' con tipo non valido."
+    for key, entry in data.items():
+        if not isinstance(key, str) or not key:
+            return False, "Trovato un nome di voce non valido."
+        if not isinstance(entry, dict):
+            return False, f"La voce '{key}' non è un oggetto valido."
 
-        totp_secret_criptato = credentials.get("totp_secret_criptato", "")
-        if totp_secret_criptato and not isinstance(totp_secret_criptato, str):
-            return False, f"La voce '{service}' ha un campo 'totp_secret_criptato' con tipo non valido."
+        item_type = entry.get("type", ITEM_TYPE_LOGIN)
+        if item_type not in VALID_ITEM_TYPES:
+            return False, f"La voce '{key}' ha un campo 'type' con valore non riconosciuto."
 
-        last_updated = credentials.get("last_updated")
+        tags = entry.get("tags")
+        if tags is not None and (not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)):
+            return False, f"La voce '{key}' ha un campo 'tags' con tipo non valido."
+
+        last_updated = entry.get("last_updated")
         if last_updated is not None:
             if not isinstance(last_updated, str):
-                return False, f"La voce '{service}' ha un campo 'last_updated' con tipo non valido."
+                return False, f"La voce '{key}' ha un campo 'last_updated' con tipo non valido."
             try:
                 datetime.fromisoformat(last_updated)
             except ValueError:
-                return False, f"La voce '{service}' ha un campo 'last_updated' con formato data non valido."
+                return False, f"La voce '{key}' ha un campo 'last_updated' con formato data non valido."
+
+        if item_type == ITEM_TYPE_LOGIN:
+            if "username" not in entry or "password_criptata" not in entry:
+                return False, f"La voce '{key}' non contiene i campi obbligatori 'username' e 'password_criptata'."
+            if not isinstance(entry["username"], str) or not isinstance(entry["password_criptata"], str):
+                return False, f"La voce '{key}' ha campi 'username' o 'password_criptata' con tipo non valido."
+            totp_secret_criptato = entry.get("totp_secret_criptato", "")
+            if totp_secret_criptato and not isinstance(totp_secret_criptato, str):
+                return False, f"La voce '{key}' ha un campo 'totp_secret_criptato' con tipo non valido."
+
+        elif item_type == ITEM_TYPE_NOTE:
+            if "content_criptato" not in entry:
+                return False, f"La voce '{key}' non contiene il campo obbligatorio 'content_criptato'."
+            if not isinstance(entry["content_criptato"], str):
+                return False, f"La voce '{key}' ha un campo 'content_criptato' con tipo non valido."
+
+        elif item_type == ITEM_TYPE_CARD:
+            if "card_number_criptato" not in entry:
+                return False, f"La voce '{key}' non contiene il campo obbligatorio 'card_number_criptato'."
+            for field in ("card_number_criptato", "cardholder_criptato", "expiry_criptato", "cvv_criptato"):
+                value = entry.get(field, "")
+                if value and not isinstance(value, str):
+                    return False, f"La voce '{key}' ha un campo '{field}' con tipo non valido."
 
     return True, ""
 
