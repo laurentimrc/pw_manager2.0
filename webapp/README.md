@@ -126,6 +126,18 @@ Verificato che questo flusso funziona interamente (setup, login, sessione persis
 
 Vale in modo analogo anche per l'app Streamlit: `streamlit run ps_manager_app.py --server.address 100.x.y.z`.
 
+**Limite PWA via Tailscale**: la webapp React è installabile come PWA (vedi sezione dedicata sotto), ma i Service Worker si registrano solo in un "contesto sicuro" (`https://`, oppure `http://localhost`/`http://127.0.0.1`). Se apri l'app dal telefono su `http://100.x.y.z:5173` (IP Tailscale in HTTP semplice, non `localhost`), il Service Worker **non si registrerà**: è una limitazione del browser, non un bug, e l'app continuerà comunque a funzionare come una normale pagina web (senza installabilità "Aggiungi a Home"). Se vuoi anche l'installabilità dal telefono via Tailscale, usa [`tailscale cert`](https://tailscale.com/kb/1153/enabling-https) per ottenere un certificato HTTPS reale per l'hostname Tailscale della macchina (es. `tuamacchina.tuatailnet.ts.net`) e servi la webapp build (`npm run build && npm run preview`, o un reverse proxy) su quell'hostname con TLS.
+
+## PWA (Progressive Web App)
+
+La webapp React (non l'app Streamlit, fuori scope) è installabile come PWA su desktop e mobile (Android/Chrome e iOS/Safari, "Aggiungi a Home"), tramite [`vite-plugin-pwa`](https://vite-pwa-org.netlify.app/):
+
+- **Manifest** (`manifest.webmanifest`, generato automaticamente e iniettato in `index.html`): nome, icone (192/512 px + variante maskable), `display: "standalone"`, colori coerenti con i design token di `index.css`.
+- **Icone**: derivate dal logo esistente (`public/favicon.svg`), rasterizzato in `public/icons/` e in `public/apple-touch-icon.png` (per l'home screen iOS, insieme ai meta tag `apple-mobile-web-app-capable`/`apple-mobile-web-app-status-bar-style` in `index.html`).
+- **Service Worker** (generato da Workbox via `vite-plugin-pwa`, strategia `generateSW`): precache **solo** dei file statici della shell (JS/CSS/HTML/icone/manifest) — mai delle risposte API. Questo è un password manager: le risposte di `/api/*` portano segreti decifrati legati alla sessione (password, segreti TOTP, numeri di carta, contenuto delle note) e **non devono mai** finire nella Cache Storage API né essere servite stale/offline. La regola `runtimeCaching` in `vite.config.ts` instrada esplicitamente ogni richiesta con path che inizia per `/api/` su strategia `NetworkOnly` (sempre rete reale, mai cache), e lo fa controllando `url.pathname` (non un pattern same-origin) così vale anche quando frontend e backend sono su origin diverse come in sviluppo. Il flusso di sessione via cookie httpOnly (`credentials: 'include'`) non cambia: ogni fetch verso il backend attraversa comunque la rete reale a ogni richiesta.
+- **Registrazione**: in `src/main.tsx`, tramite il modulo virtuale `virtual:pwa-register` di `vite-plugin-pwa`. Strategia di aggiornamento `prompt` (non `autoUpdate`): alla disponibilità di una nuova versione viene chiesta conferma esplicita prima di ricaricare la pagina, per non interrompere a sorpresa un form compilato o un segreto mostrato a schermo.
+- Il Service Worker **non è attivo in `npm run dev`** (Vite dev server): per vederlo serve una build di produzione (`npm run build` seguito da `npm run preview`, o il deploy reale).
+
 ## Test
 
 ```bash

@@ -56,6 +56,8 @@ Questo password manager è stato sviluppato come progetto didattico. Sebbene imp
     * Su richiesta esplicita (bottone in Dashboard Sicurezza), verifica se una password compare in violazioni di dati pubblicamente note, usando l'API "Pwned Passwords" di Have I Been Pwned con il modello **k-anonymity**: solo un prefisso a 5 caratteri esadecimali dell'hash SHA-1 della password viene inviato in rete, mai la password in chiaro né l'hash completo. Nessun controllo automatico al caricamento della pagina. **Disponibile solo nella webapp React** (vedi sotto).
 * **Interfaccia Utente Web:**
     * Interfaccia utente intuitiva e reattiva costruita con Streamlit, con schermate di login/setup centrate, dashboard di sicurezza con metriche riassuntive e pagina Utility organizzata in tab.
+* **Installabile come PWA (solo webapp React):**
+    * La webapp React è installabile ("Aggiungi a Home"/"Installa app") su desktop, Android e iOS, con icona e manifest dedicati. Il Service Worker precarica solo i file statici dell'interfaccia: le chiamate API (che trasportano segreti decifrati) non vengono mai messe in cache, vanno sempre in rete. Dettagli in [`webapp/README.md`](webapp/README.md).
 
 ---
 
